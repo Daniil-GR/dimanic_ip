@@ -15,13 +15,15 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from check_proxy import API, ApiError, CONFIG, parse_link, resolve_ips, field, safe_result
+from target_store import save_target, restore_target
 
 ROOT = Path(__file__).resolve().parent
 REPORTS = CONFIG.parent / 'reports'
+LAST_PROXY = CONFIG.parent / 'last_proxy.json'
 TOKEN = secrets.token_urlsafe(32)
 LOCK = threading.Lock()
 STATE = {'phase':'idle','rows':[], 'ips':[], 'host':'', 'port':None, 'source':'',
-         'current':'', 'done':0, 'total':0, 'error':'', 'started_at':'', 'finished_at':''}
+         'current':'', 'done':0, 'total':0, 'error':'', 'started_at':'', 'finished_at':'', 'scan_id':''}
 LAST = None
 CLIENT = None
 DNS_PREVIEW = None
@@ -108,7 +110,6 @@ def save_report():
     os.replace(tmp,REPORTS/'latest.json')
 
 def run_scan(target, timeout, repeat, chosen=None):
-    global LAST
     host,port,secret = target
     try:
         api = client()
@@ -118,8 +119,6 @@ def run_scan(target, timeout, repeat, chosen=None):
         else:
             ips = chosen
             change(total=len(ips),phase='checking')
-        with LOCK:
-            LAST = target
         for i,ip in enumerate(ips,1):
             change(current=ip)
             first = safe_result(api,ip,port,secret,timeout)
@@ -144,6 +143,9 @@ def run_scan(target, timeout, repeat, chosen=None):
         (REPORTS/('proxy-check-'+stamp+'.csv')).write_bytes(csv_bytes(report['rows']))
         tmp = REPORTS/'latest.tmp'
         tmp.write_bytes(raw)
+        # Write credentials separately, bound to this exact report. If interrupted,
+        # mismatching scan IDs prevent accidentally repeating with another secret.
+        save_target(LAST_PROXY,report,target)
         os.replace(tmp,REPORTS/'latest.json')
         change(phase='done')
     except (ValueError,ApiError,OSError) as e:
@@ -152,7 +154,7 @@ def run_scan(target, timeout, repeat, chosen=None):
         change(phase='error',error='Внутренняя ошибка проверки. Частичные результаты сохранены в памяти.',current='',finished_at=now())
 
 def start_scan(body):
-    global DNS_PREVIEW
+    global DNS_PREVIEW, LAST
     link = body.get('link','')
     if not isinstance(link,str) or len(link)>8192:
         raise ValueError('Некорректная ссылка.')
@@ -166,14 +168,18 @@ def start_scan(body):
             raise ValueError('Дождитесь завершения текущей операции.')
         if not CONFIG.is_file():
             raise ValueError('Сначала сохраните API-ключ.')
-        target = parse_link(link) if link else LAST
+        try:
+            target = parse_link(link) if link else LAST
+        except ValueError:
+            raise ValueError('Некорректная MTProto-ссылка.') from None
         if target is None:
             raise ValueError('Вставьте MTProto-ссылку.')
         if mode == 'all':
             chosen = None
-            STATE.update(host=target[0],port=target[1],rows=[],ips=[],source='',total=0,phase='dns')
+            STATE.update(host=target[0],port=target[1],rows=[],ips=[],source='',total=0,phase='dns',scan_id=secrets.token_hex(16))
+            LAST = target
         elif mode in ('one','failed'):
-            if LAST is None or target != LAST:
+            if LAST is None or target != LAST or (target[0],target[1]) != (STATE['host'],STATE['port']):
                 raise ValueError('Для повтора используйте последний проверенный прокси.')
             chosen = ([body.get('ip')] if mode == 'one' else
                       [r['ip'] for r in STATE['rows'] if r['local_data'] is not True])
@@ -264,7 +270,7 @@ class Handler(BaseHTTPRequestHandler):
             data['has_key'] = CONFIG.is_file()
             data['dynadot'] = dynadot.public_config()
             with LOCK:
-                data['can_repeat'] = LAST is not None
+                data['can_repeat'] = LAST is not None and (LAST[0],LAST[1]) == (STATE['host'],STATE['port'])
             self.out(data)
         elif self.path == '/export.json':
             self.send(200,json.dumps(snapshot(),ensure_ascii=False,indent=2).encode(),'application/json; charset=utf-8','proxy-check.json')
@@ -306,6 +312,7 @@ class Handler(BaseHTTPRequestHandler):
             self.out({'error':str(e)},400)
 
 def main():
+    global LAST
     p = argparse.ArgumentParser(description='Локальный MTProto dashboard')
     p.add_argument('--port',type=int,default=8765)
     p.add_argument('--no-browser',action='store_true')
@@ -319,6 +326,7 @@ def main():
             if isinstance(old,dict) and isinstance(old.get('rows'),list):
                 STATE.update({k:old[k] for k in STATE if k in old})
                 STATE.update(phase='done',current='',error='')
+                LAST = restore_target(LAST_PROXY,STATE)
         except (OSError,ValueError):
             pass
     try:

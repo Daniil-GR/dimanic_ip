@@ -7,3 +7,6 @@ api_key*
 
 dynadot.json
 dns-backups/
+
+last_proxy.json
+last_proxy.json.*.tmp

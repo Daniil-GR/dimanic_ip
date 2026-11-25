@@ -25,9 +25,9 @@ function buttons(){
   dnsButtons();
   const lock=busy||active();
   $('start').disabled=lock||!state.has_key;
-  $('failed').disabled=lock||!state.can_repeat||!state.rows.some(r=>r.local_data!==true);
+  $('failed').disabled=lock||!state.has_key||!state.can_repeat||!state.rows.some(r=>r.local_data!==true);
   $('keyForm').querySelector('button').disabled=lock;
-  document.querySelectorAll('[data-repeat]').forEach(b=>b.disabled=lock||!state.can_repeat);
+  document.querySelectorAll('[data-repeat]').forEach(b=>b.disabled=lock||!state.has_key||!state.can_repeat);
   $('copyCandidates').disabled=!state.rows.some(r=>r.action==='REVIEW_DNS');
 }
 $('scanForm').addEventListener('submit',e=>{e.preventDefault();run();});
@@ -64,6 +64,8 @@ document.addEventListener('click',e=>{
 function render(){
   dnsRender();
   const p=state.phase;
+  $('savedLinkHint').textContent=state.can_repeat?'Сохранённый прокси: '+state.host+':'+state.port+'. Оставьте поле пустым для повторной проверки или вставьте новую ссылку.':state.rows.length?'Для старого отчёта ссылка не сохранена. Введите её и запустите проверку один раз.':'Ссылка сохраняется локально после завершённой проверки.';
+  $('link').placeholder=state.can_repeat?'Использовать сохранённый прокси или вставить новую ссылку':'tg://proxy?server=…&port=443&secret=…';
   if(lastKey!==state.has_key){lastKey=state.has_key;$('keyPanel').hidden=state.has_key;}
   $('keyState').textContent=state.has_key?'Ключ сохранён':'Нужен ключ';
   $('keyHint').textContent=state.has_key?'Введите новый ключ для замены.':'Введите ключ из Telegram-бота.';
