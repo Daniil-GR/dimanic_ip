@@ -278,21 +278,51 @@ def select_zone(host,domains):
         raise ValueError('Прокси использует корневой домен. Разрешено удалять только A-записи поддоменов.')
     return z
 
-def get_zone(c):
-    data=request(c,'GET')
+def dns_shape(obj):
+    # Only recognised schema field names and their types; never print records,
+    # values, account information or authentication headers.
+    if not isinstance(obj,dict):
+        return type(obj).__name__
+    keys=('glue_info','glue_type','domain_info','dns_main_list','dns_sub_list',
+          'main_list','sub_list','ttl','nameserver_list')
+    return ', '.join(k+':'+type(obj[k]).__name__ for k in keys if k in obj) or 'нет ожидаемых полей'
+
+def parse_zone(data,zone):
+    prefix=f'Dynadot GET_DNS ({zone}): '
     g=data.get('glue_info')
-    if not isinstance(g,dict) or g.get('glue_type')!='dns':
-        raise ValueError('Домен не использует Dynadot DNS или формат ответа изменился.')
+    if not isinstance(g,dict):
+        if 'glue_type' in data and ('dns_main_list' in data or 'dns_sub_list' in data):
+            g=data
+        else:
+            raise ValueError(prefix+'неизвестная структура ответа. data: '+dns_shape(data)+
+                             '; glue_info: '+dns_shape(g)+'. Изменение DNS запрещено.')
+    mode=g.get('glue_type')
+    if not isinstance(mode,str) or mode.strip().lower()!='dns':
+        known={'none','registrar_parking','name_servers','registrar_forwarding',
+               'registrar_stealth_forwarding','registrar_email_hosting',
+               'registrar_dynamic_website','registrar_advanced_hosting','registrar_free_hosting',
+               'registrar_site_builder','for_sale_landing_page','storefront','parkbot','geo_forward'}
+        value=mode.strip().lower() if isinstance(mode,str) else ''
+        if value in known:
+            raise ValueError(prefix+'тип DNS: '+value+'. Зона не использует Dynadot DNS. Изменение запрещено.')
+        raise ValueError(prefix+'неизвестное поле glue_type ('+type(mode).__name__+
+                         '); data: '+dns_shape(data)+'; glue_info: '+dns_shape(g)+
+                         '. Изменение DNS запрещено.')
     for key in ('dns_main_list','dns_sub_list'):
         rows=g.get(key)
         if not isinstance(rows,list) or any(not isinstance(r,dict) for r in rows):
-            raise ValueError('Неполный список DNS-записей. Изменение запрещено.')
+            raise ValueError(prefix+'неполный список DNS-записей: '+key+' ('+
+                             type(rows).__name__+'). '+dns_shape(g)+'. Изменение запрещено.')
         for r in rows:
             if not isinstance(r.get('record_type'),str) or not isinstance(r.get('record_value1'),str):
-                raise ValueError('Неизвестный формат DNS-записи.')
+                raise ValueError(prefix+'неизвестный формат DNS-записи. Изменение запрещено.')
             if key=='dns_sub_list' and not isinstance(r.get('sub_host'),str):
-                raise ValueError('Неизвестный формат поддомена.')
+                raise ValueError(prefix+'неизвестный формат поддомена. Изменение запрещено.')
     return g
+
+def get_zone(c):
+    zone=domain(c['zone'])
+    return parse_zone(request(c,'GET'),zone)
 
 def subhost(host,c):
     h=domain(host)

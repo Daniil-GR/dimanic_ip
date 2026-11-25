@@ -77,5 +77,35 @@ class DynadotSignatureTests(unittest.TestCase):
         self.assertEqual(modes,['none','uuid'])
         self.assertEqual(write.call_args.args[1]['request_id_mode'],'uuid')
 
+class DynadotZoneTests(unittest.TestCase):
+    def setUp(self):
+        self.zone={'glue_type':'DNS','dns_main_list':[],
+                   'dns_sub_list':[{'sub_host':'dev2','record_type':'a','record_value1':'192.0.2.10'}],
+                   'ttl':'300'}
+
+    def test_nested_uppercase(self):
+        self.assertEqual(d.parse_zone({'glue_info':self.zone},'example.com'),self.zone)
+
+    def test_flat_explicit_dns(self):
+        self.assertEqual(d.parse_zone(self.zone,'example.com'),self.zone)
+
+    def test_external_dns_rejected(self):
+        with self.assertRaisesRegex(ValueError,'name_servers'):
+            d.parse_zone({'glue_info':dict(self.zone,glue_type='name_servers')},'example.com')
+
+    def test_missing_mode_rejected(self):
+        data=dict(self.zone)
+        del data['glue_type']
+        with self.assertRaises(ValueError):
+            d.parse_zone({'glue_info':data},'example.com')
+
+    def test_diagnostic_shows_zone_not_values(self):
+        with self.assertRaisesRegex(ValueError,r'example\.com') as err:
+            d.parse_zone({'glue_info':{'glue_type':'unexpected-private-value'}},'example.com')
+        self.assertNotIn('unexpected-private-value',str(err.exception))
+
+    def test_zone_selection_uses_parent(self):
+        self.assertEqual(d.select_zone('dev2.example.com',['example.net','example.com']),'example.com')
+
 if __name__=='__main__':
     unittest.main()
