@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timezone
 from urllib.request import Request, build_opener
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from check_proxy import CONFIG, NoRedirect
 
 FILE = CONFIG.parent / 'dynadot.json'
@@ -40,17 +41,16 @@ def config():
         cfg=json.loads(FILE.read_text(encoding='utf-8'))
         if cfg['mode'] not in BASE or not cfg['key'] or not cfg['secret']:
             raise ValueError
-        domain(cfg['zone'])
-        return cfg
+        return {k:cfg[k] for k in ('mode','key','secret')}
     except (OSError,ValueError,KeyError,TypeError):
         raise ValueError('Некорректные локальные настройки Dynadot.') from None
 
 def public_config():
     try:
         c=config()
-        return {'configured':True,'zone':c['zone'],'mode':c['mode']}
+        return {'configured':True,'mode':c['mode']}
     except ValueError:
-        return {'configured':False,'zone':'','mode':'production'}
+        return {'configured':False,'mode':'production'}
 
 def private_write(path, obj):
     path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -65,7 +65,7 @@ def private_write(path, obj):
             temp.unlink()
 
 def save_config(body):
-    c={'zone':domain(body.get('zone')),'mode':body.get('mode','production')}
+    c={'mode':body.get('mode','production')}
     if c['mode'] not in BASE:
         raise ValueError('Некорректный режим API.')
     for k in ('key','secret'):
@@ -73,14 +73,15 @@ def save_config(body):
         if not isinstance(v,str) or not v.strip() or len(v)>2048 or any(ord(x)<33 or ord(x)>126 for x in v.strip()):
             raise ValueError('Введите API Key и Secret Key.')
         c[k]=v.strip()
-    get_zone(c)
+    domains=list_domains(c)
     private_write(FILE,c)
-    return public_config()
+    return dict(public_config(),domain_count=len(domains))
 
 _last=0.0
-def request(c,method,payload=None):
+def request(c,method,payload=None,path=None):
     global _last
-    path='/restful/v2/domains/'+domain(c['zone'])+'/records'
+    if path is None:
+        path='/restful/v2/domains/'+domain(c['zone'])+'/records'
     body='' if payload is None else json.dumps(payload,ensure_ascii=True,separators=(',',':'))
     request_id=str(uuid.uuid4())
     message='\n'.join((c['key'],path,request_id,body)).encode()
@@ -95,16 +96,73 @@ def request(c,method,payload=None):
             raw=json.loads(r.read(4*1024*1024))
     except HTTPError as e:
         code=e.code
-        e.close()
-        raise ValueError(f'Dynadot HTTP {code}. Проверьте ключи, разрешённый внешний IP, домен и лимиты.') from None
+        try:
+            error=json.loads(e.read(65536))
+        except (ValueError,OSError):
+            error={}
+        finally:
+            e.close()
+        detail=error_message(error,c,signature)
+        raise DynadotError(code,detail) from None
     except (URLError,OSError,ValueError):
         raise ValueError('Dynadot: ошибка сети или ответа. Не повторяйте удаление вслепую; обновите DNS-список.') from None
     if not isinstance(raw,dict) or str(raw.get('code')) not in ('0','200'):
-        raise ValueError('Dynadot отклонил запрос или вернул неизвестный формат.')
+        raise DynadotError(raw.get('code','?') if isinstance(raw,dict) else '?',error_message(raw,c,signature))
     data=raw.get('data')
     if not isinstance(data,dict):
         raise ValueError('Dynadot: неизвестная структура ответа.')
     return data
+
+class DynadotError(ValueError):
+    def __init__(self,code,detail):
+        self.code=code
+        self.detail=detail
+        super().__init__(f'Dynadot HTTP/API {code}: {detail}')
+
+def error_message(raw,c,signature):
+    if not isinstance(raw,dict):
+        return 'Неизвестный формат ошибки API.'
+    v=raw.get('message') or raw.get('error') or raw.get('error_message')
+    if not isinstance(v,str):
+        return 'Dynadot не предоставил текст ошибки. Проверьте ключи и разрешённый IP.'
+    for secret in (c['key'],c['secret'],signature):
+        if secret:
+            v=v.replace(secret,'[скрыто]')
+    return ' '.join(v.split())[:500]
+
+def list_domains(c):
+    found=set()
+    size=100
+    for page in range(1,501):
+        path='/restful/v2/domains?'+urlencode({'page':page,'page_size':size,'sort':'name_asc','status':'active'})
+        try:
+            data=request(c,'GET',path=path)
+        except DynadotError as e:
+            if page>1 and str(e.code)=='400' and 'page is out of range' in e.detail.lower():
+                return sorted(found)
+            raise
+        rows=data.get('domain_info_list')
+        if not isinstance(rows,list):
+            raise ValueError('Dynadot: неизвестная структура списка доменов.')
+        names={domain(r['domain_name']) for r in rows if isinstance(r,dict) and isinstance(r.get('domain_name'),str)}
+        if len(names)!=len(rows):
+            raise ValueError('Dynadot: неполный или повторяющийся список доменов.')
+        if names & found:
+            raise ValueError('Dynadot: повтор страниц списка доменов. Изменение DNS запрещено.')
+        found.update(names)
+        if not rows or len(rows)<size:
+            return sorted(found)
+    raise ValueError('Слишком много страниц Dynadot. Изменение DNS запрещено.')
+
+def select_zone(host,domains):
+    h=domain(host)
+    matches=[z for z in domains if h==z or h.endswith('.'+z)]
+    if not matches:
+        raise ValueError('Домен прокси не найден среди активных доменов аккаунта Dynadot.')
+    z=max(matches,key=len)
+    if h==z:
+        raise ValueError('Прокси использует корневой домен. Разрешено удалять только A-записи поддоменов.')
+    return z
 
 def get_zone(c):
     data=request(c,'GET')
@@ -150,6 +208,7 @@ def canonical(g):
 
 def preview(state):
     c=config()
+    c=dict(c,zone=select_zone(state['host'],list_domains(c)))
     sub=subhost(state['host'],c)
     g=get_zone(c)
     found=matching(g,sub)

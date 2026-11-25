@@ -108,11 +108,11 @@ function dnsButtons(){
 }
 function dnsRender(){
   const c=state.dynadot||{};
-  $('dnsState').textContent=c.configured?c.zone+' · '+c.mode:'Не настроен';
+  $('dnsState').textContent=c.configured?'Подключён · '+c.mode:'Не настроен';
   $('dnsHost').textContent=state.host||'Нет отчёта';
-  const fp=JSON.stringify([state.host,state.started_at,state.finished_at,c.zone,c.mode,c.configured]);
+  const fp=JSON.stringify([state.host,state.started_at,state.finished_at,c.mode,c.configured]);
   if(dnsFingerprint!==fp){dnsFingerprint=fp;dns=null;$('dnsPreview').hidden=true;}
-  if(c.configured&&!$('dnsZone').value){$('dnsZone').value=c.zone;$('dnsMode').value=c.mode;}
+  if(c.configured&&!$('dnsSettings').open){$('dnsMode').value=c.mode;}
 }
 async function dnsCall(fn){
   if(dnsBusy||busy||active())return;
@@ -121,9 +121,9 @@ async function dnsCall(fn){
 }
 $('dnsConfig').addEventListener('submit',e=>{
   e.preventDefault();dnsCall(async()=>{
-    await post('/api/dynadot/config',{zone:$('dnsZone').value,mode:$('dnsMode').value,key:$('dnsKey').value,secret:$('dnsSecret').value});
+    const result=await post('/api/dynadot/config',{mode:$('dnsMode').value,key:$('dnsKey').value,secret:$('dnsSecret').value});
     $('dnsKey').value='';$('dnsSecret').value='';$('dnsSettings').open=false;dns=null;$('dnsPreview').hidden=true;
-    dnsMsg('Подключение проверено. Настройки сохранены локально.');
+    dnsMsg('Подключение проверено. Активных доменов: '+result.domain_count+'. Настройки сохранены локально.');
   });
 });
 $('dnsLoad').onclick=()=>dnsCall(async()=>{
@@ -131,7 +131,7 @@ $('dnsLoad').onclick=()=>dnsCall(async()=>{
   dns=await post('/api/dynadot/preview',{});
   $('dnsRows').innerHTML=dns.records.map(r=>'<tr><td><input type="checkbox" data-dns-ip="'+esc(r.ip)+'" '+(!r.eligible?'disabled':'')+' aria-label="Выбрать '+esc(r.ip)+'"></td><td>'+esc(r.ip)+'</td><td class="'+color(r.ru)+'">'+esc(fmt(r.ru))+'</td><td class="'+color(r.ext)+'">'+esc(fmt(r.ext))+'</td><td>'+esc(r.status)+'</td></tr>').join('');
   $('dnsPreview').hidden=false;
-  dnsMsg(dns.records.length?'Найдено записей: '+dns.records.length+' · '+dns.host:'У этого поддомена нет точных A-записей в Dynadot.');
+  dnsMsg(dns.records.length?'Найдено записей: '+dns.records.length+' · '+dns.host+' (зона '+dns.zone+')':'У этого поддомена нет точных A-записей в Dynadot.');
 });
 $('dnsRows').addEventListener('change',dnsButtons);
 $('dnsSelect').onclick=()=>{
