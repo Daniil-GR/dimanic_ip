@@ -14,9 +14,11 @@ async function post(path,data){
 }
 async function run(mode='all',ip=null){
   if(busy)return;
+  const auto=mode==='all'&&$('autoCleanup').checked;
   busy=true;buttons();message('');
   try{
-    await post('/api/check',{link:mode==='all'?$('link').value:'',timeout:Number($('timeout').value),repeat:$('repeat').checked,mode,ip});
+    await post('/api/check',{link:mode==='all'?$('link').value:'',timeout:Number($('timeout').value),repeat:$('repeat').checked,mode,ip,auto_cleanup:auto});
+    if(auto)$('autoCleanup').checked=false;
     $('link').value='';$('link').type='password';$('showLink').textContent='Показать';await poll();
   }catch(e){message(e.message);}finally{busy=false;buttons();}
 }
@@ -25,6 +27,8 @@ function buttons(){
   dnsButtons();
   const lock=busy||active();
   $('start').disabled=lock||!state.has_key;
+  $('autoCleanup').disabled=lock||!state.dynadot?.configured||state.dynadot.mode!=='production';
+  if(!state.dynadot?.configured||state.dynadot.mode!=='production')$('autoCleanup').checked=false;
   $('failed').disabled=lock||!state.has_key||!state.can_repeat||!state.rows.some(r=>r.local_data!==true);
   $('keyForm').querySelector('button').disabled=lock;
   document.querySelectorAll('[data-repeat]').forEach(b=>b.disabled=lock||!state.has_key||!state.can_repeat);
@@ -64,6 +68,8 @@ document.addEventListener('click',e=>{
 function render(){
   dnsRender();
   const p=state.phase;
+  const ar=state.auto_result;
+  $('autoResult').textContent=ar?'Автоудаление: '+ar.message+(ar.removed?.length?' Удалены: '+ar.removed.join(', '):'')+(ar.protected?.length?' Защищены: '+ar.protected.join(', '):'')+(ar.backup?' Резервная копия: '+ar.backup:''):'';
   $('savedLinkHint').textContent=state.can_repeat?'Сохранённый прокси: '+state.host+':'+state.port+'. Оставьте поле пустым для повторной проверки или вставьте новую ссылку.':state.rows.length?'Для старого отчёта ссылка не сохранена. Введите её и запустите проверку один раз.':'Ссылка сохраняется локально после завершённой проверки.';
   $('link').placeholder=state.can_repeat?'Использовать сохранённый прокси или вставить новую ссылку':'tg://proxy?server=…&port=443&secret=…';
   if(lastKey!==state.has_key){lastKey=state.has_key;$('keyPanel').hidden=state.has_key;}

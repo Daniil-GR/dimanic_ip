@@ -10,3 +10,6 @@ dns-backups/
 
 last_proxy.json
 last_proxy.json.*.tmp
+
+protected_ipv4.json
+protected_ipv4.json.*.tmp

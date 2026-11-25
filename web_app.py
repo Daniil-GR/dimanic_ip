@@ -2,6 +2,7 @@
 import argparse
 import dynadot_dns as dynadot
 import dynadot_add as dns_add
+import auto_dns
 import copy
 import csv
 import io
@@ -22,10 +23,11 @@ from target_store import save_target, restore_target
 ROOT = Path(__file__).resolve().parent
 REPORTS = CONFIG.parent / 'reports'
 LAST_PROXY = CONFIG.parent / 'last_proxy.json'
+PROTECTED = CONFIG.parent / 'protected_ipv4.json'
 TOKEN = secrets.token_urlsafe(32)
 LOCK = threading.Lock()
 STATE = {'phase':'idle','rows':[], 'ips':[], 'host':'', 'port':None, 'source':'',
-         'current':'', 'done':0, 'total':0, 'error':'', 'started_at':'', 'finished_at':'', 'scan_id':''}
+         'current':'', 'done':0, 'total':0, 'error':'', 'started_at':'', 'finished_at':'', 'scan_id':'', 'auto_result':None}
 LAST = None
 CLIENT = None
 DNS_PREVIEW = None
@@ -115,11 +117,48 @@ def save_report():
         save_target(LAST_PROXY,report,LAST)
     os.replace(tmp,REPORTS/'latest.json')
 
-def run_scan(target, timeout, repeat, chosen=None):
+def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected):
+    selected,reason=auto_dns.plan(ips,rows,protected)
+    result={'status':'skipped','message':reason,'removed':[],'protected':sorted(protected & set(ips))}
+    if not selected:
+        return result
+    try:
+        # Recheck account ownership and exact initial DNS snapshot inside remove.
+        if dynadot.config()!={k:c[k] for k in ('mode','key','secret','request_id_mode')}:
+            raise ValueError('Настройки Dynadot изменились.')
+        if dynadot.select_zone(host,dynadot.list_domains(c))!=c['zone']:
+            raise ValueError('DNS-зона изменилась.')
+        result.update(status='checking',message='Удаление подтверждённых недоступных IPv4…')
+        change(auto_result=dict(result))
+        deleted=dynadot.remove(c,sub,zone,selected)
+        result.update(status='removed',message='Удаление подтверждено Dynadot.',
+                      removed=deleted['removed'],backup=deleted['backup'],
+                      measurements=[r for r in rows if r['ip'] in selected])
+        remaining=deleted['remaining']
+        change(rows=[r for r in rows if r['ip'] in remaining],ips=remaining,
+               done=len(remaining),total=len(remaining),
+               source='Dynadot API (после автоудаления; DNS-кэш может отличаться)')
+    except Exception as e:
+        result.update(status='error',message='Автоудаление не подтверждено: '+str(e)+
+                      ' Обновите DNS-список вручную. Автоматического повтора нет.')
+    return result
+
+def run_scan(target, timeout, repeat, chosen=None, auto=False):
     host,port,secret = target
     try:
         api = client()
-        if chosen is None:
+        if auto:
+            c=dynadot.config()
+            if c['mode']!='production':
+                raise ValueError('Автоудаление доступно только для Production.')
+            c=dict(c,zone=dynadot.select_zone(host,dynadot.list_domains(c)))
+            sub=dynadot.subhost(host,c)
+            zone=dynadot.get_zone(c)
+            ips=sorted(dynadot.matching(zone,sub))
+            if not ips:
+                raise ValueError('В Dynadot нет A-записей текущего поддомена.')
+            change(ips=ips,source='Dynadot API (текущий пул A-записей)',total=len(ips),phase='checking')
+        elif chosen is None:
             ips,source = resolve_ips(host)
             change(ips=ips,source=source,total=len(ips),phase='checking')
         else:
@@ -129,8 +168,10 @@ def run_scan(target, timeout, repeat, chosen=None):
             change(current=ip)
             first = safe_result(api,ip,port,secret,timeout)
             second = None
-            if repeat and field(first,'local','data') is not True:
+            if (repeat or auto) and field(first,'local','data') is not True:
                 change(current=ip+' · повтор')
+                if auto:
+                    time.sleep(5)
                 second = safe_result(api,ip,port,secret,timeout)
             row = row_for(ip,port,first,second)
             with LOCK:
@@ -138,6 +179,16 @@ def run_scan(target, timeout, repeat, chosen=None):
                 order = {v:j for j,v in enumerate(STATE['ips'])}
                 STATE['rows'].sort(key=lambda r:order.get(r['ip'],0))
                 STATE['done'] = i
+        try:
+            rows=snapshot()['rows']
+            # Only measurements made in this run may release provisioning protection.
+            protected=auto_dns.release_healthy(PROTECTED,host,[r for r in rows if r['ip'] in ips],dynadot.private_write)
+            if auto:
+                change(current='Проверка условий автоудаления')
+                change(auto_result=apply_auto_cleanup(c,sub,zone,host,ips,rows,protected))
+        except (ValueError,OSError) as exc:
+            if auto:
+                change(auto_result={'status':'skipped','message':str(exc),'removed':[]})
         change(phase='saving',current='',finished_at=now())
         # Persist a finished snapshot while preventing concurrent scans until write completes.
         report = snapshot()
@@ -169,6 +220,11 @@ def start_scan(body):
         raise ValueError('Таймаут должен быть от 1 до 15 секунд.')
     repeat = body.get('repeat',True) is True
     mode = body.get('mode','all')
+    auto = body.get('auto_cleanup') is True
+    if auto and mode!='all':
+        raise ValueError('Автоудаление разрешено только при полной проверке.')
+    if auto and dynadot.config()['mode']!='production':
+        raise ValueError('Автоудаление доступно только для Production.')
     with LOCK:
         if STATE['phase'] in ('dns','checking','saving','key'):
             raise ValueError('Дождитесь завершения текущей операции.')
@@ -181,6 +237,17 @@ def start_scan(body):
         if target is None:
             raise ValueError('Вставьте MTProto-ссылку.')
         if mode == 'all':
+            # Migrate new, untested addresses from the previous version before resetting the report.
+            if STATE['host']==target[0]:
+                pending=[r['ip'] for r in STATE['rows'] if r.get('api_status')=='NOT_TESTED']
+                if pending:
+                    try:
+                        auto_dns.protect(PROTECTED,target[0],pending,dynadot.private_write)
+                    except (ValueError,OSError):
+                        if auto:
+                            raise ValueError('Не удалось сохранить защиту новых IP. Автоудаление запрещено.') from None
+            if auto:
+                auto_dns.read_protected(PROTECTED)
             chosen = None
             STATE.update(host=target[0],port=target[1],rows=[],ips=[],source='',total=0,phase='dns',scan_id=secrets.token_hex(16))
             LAST = target
@@ -194,10 +261,10 @@ def start_scan(body):
             STATE.update(phase='checking',total=len(chosen))
         else:
             raise ValueError('Неизвестный режим.')
-        STATE.update(done=0,current='',error='',started_at=now(),finished_at='')
+        STATE.update(done=0,current='',error='',started_at=now(),finished_at='',auto_result=None)
         DNS_PREVIEW = None
         ADD_PREVIEW = None
-    threading.Thread(target=run_scan,args=(target,timeout,repeat,chosen),daemon=True).start()
+    threading.Thread(target=run_scan,args=(target,timeout,repeat,chosen,auto),daemon=True).start()
 
 def dns_operation(path,body):
     global DNS_PREVIEW, ADD_PREVIEW
@@ -266,6 +333,9 @@ def dns_operation(path,body):
                 raise ValueError('Настройки Dynadot изменились.')
             if dynadot.select_zone(state['host'],dynadot.list_domains(p[4]))!=p[4]['zone']:
                 raise ValueError('Домен в Dynadot изменился. Повторите проверку.')
+            if p[4]['mode']=='production':
+                # Persist protection BEFORE POST, including ambiguous network failures.
+                auto_dns.protect(PROTECTED,state['host'],selected,dynadot.private_write)
             result=dns_add.append_records(p[4],p[5],p[6],selected)
             # Sandbox records must never be represented as live public DNS.
             if result['mode']=='production':
