@@ -73,7 +73,18 @@ def save_config(body):
         if not isinstance(v,str) or not v.strip() or len(v)>2048 or any(ord(x)<33 or ord(x)>126 for x in v.strip()):
             raise ValueError('Введите API Key и Secret Key.')
         c[k]=v.strip()
-    domains=list_domains(c)
+    try:
+        domains=list_domains(c)
+    except DynadotError as first:
+        if str(first.code) not in ('400','401','403'):
+            raise
+        try:
+            request(c,'GET',path='/restful/v2/accounts/info')
+        except DynadotError as diagnostic:
+            raise ValueError(f'{first}. Проверка ACCOUNT_INFO: {diagnostic}. Проверьте пару ключей и внешний IP в Tools → API.') from None
+        except ValueError as diagnostic:
+            raise ValueError(f'{first}. Проверка ACCOUNT_INFO: {diagnostic}') from None
+        raise ValueError(f'{first}. ACCOUNT_INFO доступен: авторизация прошла, ошибка относится к DOMAIN_LIST.') from None
     private_write(FILE,c)
     return dict(public_config(),domain_count=len(domains))
 
@@ -86,9 +97,11 @@ def request(c,method,payload=None,path=None):
     request_id=str(uuid.uuid4())
     message='\n'.join((c['key'],path,request_id,body)).encode()
     signature=base64.b64encode(hmac.new(c['secret'].encode(),message,hashlib.sha256).digest()).decode()
-    req=Request(BASE[c['mode']]+path,data=body.encode() if payload is not None else None,method=method,
-                headers={'Authorization':'Bearer '+c['key'],'X-Request-ID':request_id,
-                         'X-Signature':signature,'Content-Type':'application/json','Accept':'application/json'})
+    headers={'Authorization':'Bearer '+c['key'],'X-Request-ID':request_id,
+             'X-Signature':signature,'Accept':'application/json'}
+    if payload is not None:
+        headers['Content-Type']='application/json'
+    req=Request(BASE[c['mode']]+path,data=body.encode() if payload is not None else None,method=method,headers=headers)
     time.sleep(max(0,1.1-(time.monotonic()-_last)))
     _last=time.monotonic()
     try:
@@ -103,28 +116,44 @@ def request(c,method,payload=None,path=None):
         finally:
             e.close()
         detail=error_message(error,c,signature)
-        raise DynadotError(code,detail) from None
+        raise DynadotError(code,detail,method,path,request_id) from None
     except (URLError,OSError,ValueError):
         raise ValueError('Dynadot: ошибка сети или ответа. Не повторяйте удаление вслепую; обновите DNS-список.') from None
     if not isinstance(raw,dict) or str(raw.get('code')) not in ('0','200'):
-        raise DynadotError(raw.get('code','?') if isinstance(raw,dict) else '?',error_message(raw,c,signature))
+        raise DynadotError(raw.get('code','?') if isinstance(raw,dict) else '?',error_message(raw,c,signature),method,path,request_id)
     data=raw.get('data')
     if not isinstance(data,dict):
         raise ValueError('Dynadot: неизвестная структура ответа.')
     return data
 
 class DynadotError(ValueError):
-    def __init__(self,code,detail):
+    def __init__(self,code,detail,method='',path='',request_id=''):
         self.code=code
         self.detail=detail
-        super().__init__(f'Dynadot HTTP/API {code}: {detail}')
+        context=f' [{method} {path}; request ID {request_id}]' if path else ''
+        super().__init__(f'Dynadot HTTP/API {code}: {detail}{context}')
 
 def error_message(raw,c,signature):
     if not isinstance(raw,dict):
         return 'Неизвестный формат ошибки API.'
-    v=raw.get('message') or raw.get('error') or raw.get('error_message')
-    if not isinstance(v,str):
-        return 'Dynadot не предоставил текст ошибки. Проверьте ключи и разрешённый IP.'
+    messages=[]
+    def collect(obj,depth=0):
+        if depth>3:
+            return
+        if isinstance(obj,dict):
+            for k,v in obj.items():
+                if k.lower() in ('message','error','error_message','detail','description','reason','errors','data'):
+                    if isinstance(v,str) and k.lower()!='data':
+                        messages.append(v)
+                    elif isinstance(v,(dict,list)):
+                        collect(v,depth+1)
+        elif isinstance(obj,list):
+            for item in obj[:10]:
+                collect(item,depth+1)
+    collect(raw)
+    v='; '.join(dict.fromkeys(messages))
+    if not v:
+        return 'Dynadot не предоставил подробности ошибки.'
     for secret in (c['key'],c['secret'],signature):
         if secret:
             v=v.replace(secret,'[скрыто]')
@@ -132,15 +161,12 @@ def error_message(raw,c,signature):
 
 def list_domains(c):
     found=set()
-    size=100
     for page in range(1,501):
-        path='/restful/v2/domains?'+urlencode({'page':page,'page_size':size,'sort':'name_asc','status':'active'})
-        try:
-            data=request(c,'GET',path=path)
-        except DynadotError as e:
-            if page>1 and str(e.code)=='400' and 'page is out of range' in e.detail.lower():
-                return sorted(found)
-            raise
+        # Start with the exact documented default request. No optional filters.
+        path='/restful/v2/domains'
+        if page>1:
+            path+='?'+urlencode({'page':page})
+        data=request(c,'GET',path=path)
         rows=data.get('domain_info_list')
         if not isinstance(rows,list):
             raise ValueError('Dynadot: неизвестная структура списка доменов.')
@@ -150,8 +176,17 @@ def list_domains(c):
         if names & found:
             raise ValueError('Dynadot: повтор страниц списка доменов. Изменение DNS запрещено.')
         found.update(names)
-        if not rows or len(rows)<size:
+        pagination=data.get('pagination_result')
+        if not isinstance(pagination,dict) or type(pagination.get('has_next_page')) is not bool:
+            raise ValueError('Dynadot: нет достоверной пагинации списка доменов. Изменение DNS запрещено.')
+        if pagination.get('page')!=page:
+            raise ValueError('Dynadot: неожиданный номер страницы.')
+        if not pagination['has_next_page']:
+            if type(pagination.get('total')) is int and len(found)!=pagination['total']:
+                raise ValueError('Dynadot: количество доменов не совпало с итогом пагинации.')
             return sorted(found)
+        if not rows:
+            raise ValueError('Dynadot: пустая промежуточная страница.')
     raise ValueError('Слишком много страниц Dynadot. Изменение DNS запрещено.')
 
 def select_zone(host,domains):
