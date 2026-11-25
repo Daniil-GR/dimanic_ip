@@ -224,7 +224,7 @@ def dns_operation(path,body):
             allowed={r['ip'] for r in p[6] if r['eligible']}
             if not isinstance(selected,list) or not selected or any(not isinstance(x,str) or x not in allowed for x in selected):
                 raise ValueError('Можно удалить только выбранные проверенные IP с RU data=false.')
-            if dynadot.config()!={k:p[3][k] for k in ('mode','key','secret')}:
+            if dynadot.config()!={k:p[3][k] for k in ('mode','key','secret','request_id_mode')}:
                 raise ValueError('Настройки Dynadot изменились.')
             if dynadot.select_zone(state['host'],dynadot.list_domains(p[3]))!=p[3]['zone']:
                 raise ValueError('Домен в Dynadot изменился. Обновите список.')

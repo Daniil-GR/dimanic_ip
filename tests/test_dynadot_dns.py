@@ -27,5 +27,32 @@ class DynadotListTests(unittest.TestCase):
         for value in ('test-key','test-secret','example-signature'):
             self.assertNotIn(value,text)
 
+class DynadotSignatureTests(unittest.TestCase):
+    def test_documented_signature_without_request_id(self):
+        headers,signature=d.signed_headers(C,'/restful/v2/domains','','')
+        self.assertEqual(signature,'Ix4scQH6cnn0NN252wiBQApR+dhG1Yo25Q17r57cBYU=')
+        self.assertNotIn('X-Request-ID',headers)
+
+    def test_documented_signature_with_request_id(self):
+        request_id='123e4567-e89b-12d3-a456-426614174000'
+        headers,signature=d.signed_headers(C,'/restful/v2/domains','',request_id)
+        self.assertEqual(signature,'A2QiImDJ+RNNAlO9btb1y4KQSz67PDkG7Hvnri/IV2w=')
+        self.assertEqual(headers['X-Request-ID'],request_id)
+
+    @patch('dynadot_dns.public_config',return_value={'configured':True})
+    @patch('dynadot_dns.private_write')
+    @patch('dynadot_dns.list_domains')
+    def test_read_only_fallback(self,listing,write,public):
+        modes=[]
+        def attempt(cfg):
+            modes.append(cfg['request_id_mode'])
+            if len(modes)==1:
+                raise d.DynadotError(400,'X-Signature provided is not valid')
+            return ['example.com']
+        listing.side_effect=attempt
+        self.assertEqual(d.save_config(C)['domain_count'],1)
+        self.assertEqual(modes,['none','uuid'])
+        self.assertEqual(write.call_args.args[1]['request_id_mode'],'uuid')
+
 if __name__=='__main__':
     unittest.main()

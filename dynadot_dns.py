@@ -41,14 +41,18 @@ def config():
         cfg=json.loads(FILE.read_text(encoding='utf-8'))
         if cfg['mode'] not in BASE or not cfg['key'] or not cfg['secret']:
             raise ValueError
-        return {k:cfg[k] for k in ('mode','key','secret')}
+        result={k:cfg[k] for k in ('mode','key','secret')}
+        result['request_id_mode']=cfg.get('request_id_mode','uuid')
+        if result['request_id_mode'] not in ('none','uuid'):
+            raise ValueError
+        return result
     except (OSError,ValueError,KeyError,TypeError):
         raise ValueError('Некорректные локальные настройки Dynadot.') from None
 
 def public_config():
     try:
         c=config()
-        return {'configured':True,'mode':c['mode']}
+        return {'configured':True,'mode':c['mode'],'request_id_mode':c['request_id_mode']}
     except ValueError:
         return {'configured':False,'mode':'production'}
 
@@ -73,20 +77,36 @@ def save_config(body):
         if not isinstance(v,str) or not v.strip() or len(v)>2048 or any(ord(x)<33 or ord(x)>126 for x in v.strip()):
             raise ValueError('Введите API Key и Secret Key.')
         c[k]=v.strip()
+    # The documented X-Request-ID header is optional. Negotiate only via
+    # read-only requests; never retry a DNS mutation with another signature.
+    c['request_id_mode']='none'
     try:
         domains=list_domains(c)
     except DynadotError as first:
-        if str(first.code) not in ('400','401','403'):
+        if not signature_rejected(first):
             raise
+        c['request_id_mode']='uuid'
         try:
-            request(c,'GET',path='/restful/v2/accounts/info')
-        except DynadotError as diagnostic:
-            raise ValueError(f'{first}. Проверка ACCOUNT_INFO: {diagnostic}. Проверьте пару ключей и внешний IP в Tools → API.') from None
-        except ValueError as diagnostic:
-            raise ValueError(f'{first}. Проверка ACCOUNT_INFO: {diagnostic}') from None
-        raise ValueError(f'{first}. ACCOUNT_INFO доступен: авторизация прошла, ошибка относится к DOMAIN_LIST.') from None
+            domains=list_domains(c)
+        except DynadotError as second:
+            raise ValueError(
+                f'Без X-Request-ID: {first}. С X-Request-ID: {second}. '
+                'Оба документированных варианта отклонены. Проверьте соответствие Production API Key и Secret Key; '
+                'если ключи верны, передайте Dynadot идентификаторы запросов, но не сами ключи.'
+            ) from None
     private_write(FILE,c)
     return dict(public_config(),domain_count=len(domains))
+
+def signature_rejected(error):
+    return str(error.code) in ('400','401','403') and 'signature' in error.detail.lower()
+
+def signed_headers(c,path,body,request_id):
+    message='\n'.join((c['key'],path,request_id,body)).encode('utf-8')
+    signature=base64.b64encode(hmac.new(c['secret'].encode('utf-8'),message,hashlib.sha256).digest()).decode('ascii')
+    headers={'Authorization':'Bearer '+c['key'],'X-Signature':signature,'Accept':'application/json'}
+    if request_id:
+        headers['X-Request-ID']=request_id
+    return headers,signature
 
 _last=0.0
 def request(c,method,payload=None,path=None):
@@ -94,11 +114,8 @@ def request(c,method,payload=None,path=None):
     if path is None:
         path='/restful/v2/domains/'+domain(c['zone'])+'/records'
     body='' if payload is None else json.dumps(payload,ensure_ascii=True,separators=(',',':'))
-    request_id=str(uuid.uuid4())
-    message='\n'.join((c['key'],path,request_id,body)).encode()
-    signature=base64.b64encode(hmac.new(c['secret'].encode(),message,hashlib.sha256).digest()).decode()
-    headers={'Authorization':'Bearer '+c['key'],'X-Request-ID':request_id,
-             'X-Signature':signature,'Accept':'application/json'}
+    request_id=str(uuid.uuid4()) if c.get('request_id_mode','uuid')=='uuid' else ''
+    headers,signature=signed_headers(c,path,body,request_id)
     if payload is not None:
         headers['Content-Type']='application/json'
     req=Request(BASE[c['mode']]+path,data=body.encode() if payload is not None else None,method=method,headers=headers)
@@ -130,7 +147,7 @@ class DynadotError(ValueError):
     def __init__(self,code,detail,method='',path='',request_id=''):
         self.code=code
         self.detail=detail
-        context=f' [{method} {path}; request ID {request_id}]' if path else ''
+        context=f' [{method} {path}; request ID {request_id or "не отправлен"}]' if path else ''
         super().__init__(f'Dynadot HTTP/API {code}: {detail}{context}')
 
 def error_message(raw,c,signature):
