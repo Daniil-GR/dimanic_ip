@@ -89,6 +89,45 @@ class DynadotZoneTests(unittest.TestCase):
     def test_flat_explicit_dns(self):
         self.assertEqual(d.parse_zone(self.zone,'example.com'),self.zone)
 
+    def test_apex_list_omitted(self):
+        data=dict(self.zone)
+        del data['dns_main_list']
+        parsed=d.parse_zone({'glue_info':data},'example.com')
+        self.assertNotIn('dns_main_list',parsed)
+        self.assertEqual(list(d.matching(parsed,'dev2')),['192.0.2.10'])
+        self.assertIsNone(d.canonical(parsed)[0])
+
+    def test_apex_list_null(self):
+        data=dict(self.zone,dns_main_list=None)
+        parsed=d.parse_zone({'glue_info':data},'example.com')
+        self.assertIsNone(d.canonical(parsed)[0])
+
+    def test_missing_sub_list_rejected(self):
+        data=dict(self.zone)
+        del data['dns_sub_list']
+        with self.assertRaises(ValueError):
+            d.parse_zone({'glue_info':data},'example.com')
+
+    def test_invalid_apex_list_rejected(self):
+        with self.assertRaises(ValueError):
+            d.parse_zone({'glue_info':dict(self.zone,dns_main_list='bad')},'example.com')
+
+    @patch('dynadot_dns.private_write')
+    @patch('dynadot_dns.request')
+    @patch('dynadot_dns.get_zone')
+    def test_exact_remove_with_omitted_apex(self,get_zone,request,write):
+        target=self.zone['dns_sub_list'][0]
+        keep=dict(target,record_value1='192.0.2.11')
+        other=dict(target,sub_host='other')
+        before={'glue_type':'dns','ttl':'300','dns_sub_list':[target,keep,other]}
+        after=dict(before,dns_sub_list=[keep,other])
+        get_zone.side_effect=[before,after]
+        request.return_value={'main_record_removed_count':0,'sub_record_removed_count':1}
+        cfg=dict(C,zone='example.com')
+        result=d.remove(cfg,'dev2',before,['192.0.2.10'])
+        request.assert_called_once_with(cfg,'DELETE',{'dns_sub_list':[target]})
+        self.assertEqual(result['remaining'],['192.0.2.11'])
+
     def test_external_dns_rejected(self):
         with self.assertRaisesRegex(ValueError,'name_servers'):
             d.parse_zone({'glue_info':dict(self.zone,glue_type='name_servers')},'example.com')

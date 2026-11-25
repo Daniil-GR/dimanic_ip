@@ -310,6 +310,10 @@ def parse_zone(data,zone):
                          '. Изменение DNS запрещено.')
     for key in ('dns_main_list','dns_sub_list'):
         rows=g.get(key)
+        # Dynadot can omit the apex list. It is not the target of REMOVE_DNS.
+        # Preserve absence/null as unknown rather than inventing an empty list.
+        if key=='dns_main_list' and rows is None:
+            continue
         if not isinstance(rows,list) or any(not isinstance(r,dict) for r in rows):
             raise ValueError(prefix+'неполный список DNS-записей: '+key+' ('+
                              type(rows).__name__+'). '+dns_shape(g)+'. Изменение запрещено.')
@@ -347,7 +351,10 @@ def matching(g,sub):
 
 def canonical(g):
     def records(key):
-        return sorted(json.dumps(r,sort_keys=True,ensure_ascii=True) for r in g[key])
+        rows=g.get(key)
+        if key=='dns_main_list' and rows is None:
+            return None
+        return sorted(json.dumps(r,sort_keys=True,ensure_ascii=True) for r in rows)
     return (records('dns_main_list'),records('dns_sub_list'),g.get('ttl'))
 
 def preview(state):
@@ -390,7 +397,7 @@ def remove(c,sub,g,selected):
         expected=dict(fresh)
         expected['dns_sub_list']=[r for r in fresh['dns_sub_list'] if r not in [found[ip] for ip in selected]]
         if (str(result.get('sub_record_removed_count'))!=str(len(selected))
-                or str(result.get('main_record_removed_count','0'))!='0'
+                or str(result.get('main_record_removed_count','0' if fresh.get('dns_main_list') is not None else '?'))!='0'
                 or canonical(after)!=canonical(expected)):
             raise ValueError('Ответ или DNS после удаления не совпал с ожидаемым. Проверьте Dynadot вручную; не повторяйте запрос.')
         audit['outcome']='verified'
