@@ -4,3 +4,6 @@ __pycache__/
 proxy-check-*.csv
 api_key*
 .env
+
+dynadot.json
+dns-backups/

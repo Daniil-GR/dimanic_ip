@@ -1,5 +1,6 @@
 """Local browser dashboard. Start with python web_app.py."""
 import argparse
+import dynadot_dns as dynadot
 import copy
 import csv
 import io
@@ -23,6 +24,7 @@ STATE = {'phase':'idle','rows':[], 'ips':[], 'host':'', 'port':None, 'source':''
          'current':'', 'done':0, 'total':0, 'error':'', 'started_at':'', 'finished_at':''}
 LAST = None
 CLIENT = None
+DNS_PREVIEW = None
 FIELDS = ('tcp','handshake','data','ssh','ping_ms','latency_ms','duration_ms')
 
 def now():
@@ -150,6 +152,7 @@ def run_scan(target, timeout, repeat, chosen=None):
         change(phase='error',error='Внутренняя ошибка проверки. Частичные результаты сохранены в памяти.',current='',finished_at=now())
 
 def start_scan(body):
+    global DNS_PREVIEW
     link = body.get('link','')
     if not isinstance(link,str) or len(link)>8192:
         raise ValueError('Некорректная ссылка.')
@@ -180,7 +183,48 @@ def start_scan(body):
         else:
             raise ValueError('Неизвестный режим.')
         STATE.update(done=0,current='',error='',started_at=now(),finished_at='')
+        DNS_PREVIEW = None
     threading.Thread(target=run_scan,args=(target,timeout,repeat,chosen),daemon=True).start()
+
+def dns_operation(path,body):
+    global DNS_PREVIEW
+    with LOCK:
+        if STATE['phase'] in ('dns','checking','saving','key'):
+            raise ValueError('Дождитесь завершения текущей операции.')
+        old=STATE['phase']
+        state=copy.deepcopy(STATE)
+        STATE['phase']='key'
+    try:
+        if path=='/api/dynadot/config':
+            DNS_PREVIEW=None
+            return dynadot.save_config(body)
+        if old!='done' or not state['host'] or not state['rows']:
+            raise ValueError('Сначала завершите проверку прокси.')
+        if path=='/api/dynadot/preview':
+            c,sub,g,records=dynadot.preview(state)
+            token=secrets.token_urlsafe(24)
+            DNS_PREVIEW=(token,time.monotonic(),state['host'],c,sub,g,records)
+            return {'token':token,'host':state['host'],'zone':c['zone'],'mode':c['mode'],
+                    'records':records}
+        if path=='/api/dynadot/delete':
+            p=DNS_PREVIEW
+            DNS_PREVIEW=None
+            if not p or body.get('token')!=p[0] or time.monotonic()-p[1]>300 or p[2]!=state['host']:
+                raise ValueError('Предпросмотр устарел. Обновите список Dynadot.')
+            if body.get('confirm')!=state['host']:
+                raise ValueError('Подтвердите точное имя поддомена.')
+            selected=body.get('ips')
+            allowed={r['ip'] for r in p[6] if r['eligible']}
+            if not isinstance(selected,list) or not selected or any(not isinstance(x,str) or x not in allowed for x in selected):
+                raise ValueError('Можно удалить только выбранные проверенные IP с RU data=false.')
+            if dynadot.config()!=p[3]:
+                raise ValueError('Настройки Dynadot изменились.')
+            result=dynadot.remove(p[3],p[4],p[5],selected)
+            # Keep the original measurements, but invalidate the current preview.
+            return result
+        raise ValueError('Неизвестная операция.')
+    finally:
+        change(phase=old)
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):
@@ -216,6 +260,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == '/api/state':
             data = snapshot()
             data['has_key'] = CONFIG.is_file()
+            data['dynadot'] = dynadot.public_config()
             with LOCK:
                 data['can_repeat'] = LAST is not None
             self.out(data)
@@ -237,7 +282,9 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n))
             if not isinstance(body,dict):
                 raise ValueError('Некорректный запрос.')
-            if self.path == '/api/check':
+            if self.path in ('/api/dynadot/config','/api/dynadot/preview','/api/dynadot/delete'):
+                self.out(dns_operation(self.path,body))
+            elif self.path == '/api/check':
                 start_scan(body)
                 self.out({'ok':True},202)
             elif self.path == '/api/key':

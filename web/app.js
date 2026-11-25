@@ -22,6 +22,7 @@ async function run(mode='all',ip=null){
 }
 function active(){return ['dns','checking','saving','key'].includes(state.phase);}
 function buttons(){
+  dnsButtons();
   const lock=busy||active();
   $('start').disabled=lock||!state.has_key;
   $('failed').disabled=lock||!state.can_repeat||!state.rows.some(r=>r.local_data!==true);
@@ -61,6 +62,7 @@ document.addEventListener('click',e=>{
   if(d)detail(d.dataset.detail);if(r)run('one',r.dataset.repeat);
 });
 function render(){
+  dnsRender();
   const p=state.phase;
   if(lastKey!==state.has_key){lastKey=state.has_key;$('keyPanel').hidden=state.has_key;}
   $('keyState').textContent=state.has_key?'Ключ сохранён':'Нужен ключ';
@@ -92,4 +94,68 @@ async function poll(){
   polling=true;try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error();state=await r.json();render();}
   catch(e){message('Нет связи с локальным сервером. Проверьте окно терминала.');}finally{polling=false;}
 }
+let dns=null,dnsBusy=false,dnsFingerprint='',dnsSelection=[];
+const dnsMsg=v=>{$('dnsMessage').textContent=v;};
+function dnsButtons(){
+  const lock=busy||dnsBusy||active();
+  $('dnsLoad').disabled=lock||!state.dynadot?.configured||state.phase!=='done';
+  $('dnsConfig').querySelector('button').disabled=lock;
+  $('start').disabled=lock||!state.has_key;
+  $('dnsSelect').disabled=lock||!dns;
+  const n=document.querySelectorAll('[data-dns-ip]:checked').length;
+  $('dnsDelete').disabled=lock||!dns||n===0||n>=dns.records.length;
+  $('dnsDelete').textContent=n?'Удалить A-записи ('+n+')':'Удалить выбранные A-записи';
+}
+function dnsRender(){
+  const c=state.dynadot||{};
+  $('dnsState').textContent=c.configured?c.zone+' · '+c.mode:'Не настроен';
+  $('dnsHost').textContent=state.host||'Нет отчёта';
+  const fp=JSON.stringify([state.host,state.started_at,state.finished_at,c.zone,c.mode,c.configured]);
+  if(dnsFingerprint!==fp){dnsFingerprint=fp;dns=null;$('dnsPreview').hidden=true;}
+  if(c.configured&&!$('dnsZone').value){$('dnsZone').value=c.zone;$('dnsMode').value=c.mode;}
+}
+async function dnsCall(fn){
+  if(dnsBusy||busy||active())return;
+  dnsBusy=true;busy=true;buttons();dnsMsg('');
+  try{await fn();}catch(e){dnsMsg(e.message);}finally{dnsBusy=false;busy=false;await poll();buttons();}
+}
+$('dnsConfig').addEventListener('submit',e=>{
+  e.preventDefault();dnsCall(async()=>{
+    await post('/api/dynadot/config',{zone:$('dnsZone').value,mode:$('dnsMode').value,key:$('dnsKey').value,secret:$('dnsSecret').value});
+    $('dnsKey').value='';$('dnsSecret').value='';$('dnsSettings').open=false;dns=null;$('dnsPreview').hidden=true;
+    dnsMsg('Подключение проверено. Настройки сохранены локально.');
+  });
+});
+$('dnsLoad').onclick=()=>dnsCall(async()=>{
+  dns=null;$('dnsPreview').hidden=true;
+  dns=await post('/api/dynadot/preview',{});
+  $('dnsRows').innerHTML=dns.records.map(r=>'<tr><td><input type="checkbox" data-dns-ip="'+esc(r.ip)+'" '+(!r.eligible?'disabled':'')+' aria-label="Выбрать '+esc(r.ip)+'"></td><td>'+esc(r.ip)+'</td><td class="'+color(r.ru)+'">'+esc(fmt(r.ru))+'</td><td class="'+color(r.ext)+'">'+esc(fmt(r.ext))+'</td><td>'+esc(r.status)+'</td></tr>').join('');
+  $('dnsPreview').hidden=false;
+  dnsMsg(dns.records.length?'Найдено записей: '+dns.records.length+' · '+dns.host:'У этого поддомена нет точных A-записей в Dynadot.');
+});
+$('dnsRows').addEventListener('change',dnsButtons);
+$('dnsSelect').onclick=()=>{
+  const boxes=[...document.querySelectorAll('[data-dns-ip]:not(:disabled)')];
+  boxes.forEach(b=>b.checked=true);if(dns&&boxes.length>=dns.records.length&&boxes.length)boxes[boxes.length-1].checked=false;
+  dnsButtons();
+};
+$('dnsDelete').onclick=()=>{
+  if(!dns)return;
+  dnsSelection=[...document.querySelectorAll('[data-dns-ip]:checked')].map(b=>b.dataset.dnsIp);
+  $('dnsConfirmText').textContent='Удалить '+dnsSelection.length+' A-записей у '+dns.host+' ('+dns.mode+')?';
+  $('dnsConfirmIPs').textContent=dnsSelection.join('\n');
+  $('dnsConfirmHost').value='';$('dnsApply').disabled=true;$('dnsConfirm').showModal();
+};
+$('dnsConfirmHost').oninput=()=>{$('dnsApply').disabled=!dns||$('dnsConfirmHost').value!==dns.host;};
+$('dnsCancel').onclick=()=>$('dnsConfirm').close();
+$('dnsApply').onclick=()=>{
+  if(!dns||$('dnsConfirmHost').value!==dns.host)return;
+  const payload={token:dns.token,ips:dnsSelection,confirm:$('dnsConfirmHost').value};
+  $('dnsConfirm').close();
+  dnsCall(async()=>{
+    dns=null;$('dnsPreview').hidden=true;
+    const result=await post('/api/dynadot/delete',payload);
+    dnsMsg('Удалено и проверено через Dynadot: '+result.removed.join(', ')+'. Осталось: '+result.remaining.length+'. Резервная копия: '+result.backup+'. Запустите новую проверку после обновления DNS.');
+  });
+};
 poll();setInterval(poll,1000);
