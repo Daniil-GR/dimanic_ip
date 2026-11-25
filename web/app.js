@@ -338,12 +338,13 @@ $('monitorStart').onclick=()=>{
   monitorAction('/api/monitor/start',{host:state.host,port:state.port,timeout:Number($('timeout').value),interval,auto_cleanup:auto,allow_empty:allowEmpty});
 };
 $('monitorStop').onclick=()=>monitorAction('/api/monitor/stop',{});
-let workspaceListSignature='',workspaceCreating=false,workspacePolling=false;
+let workspaceListSignature='',workspaceCreating=false,workspacePolling=false,workspaceDeleting=false;
 async function refreshWorkspaces(){
   if(workspacePolling)return;
   workspacePolling=true;
   try{
     const response=await fetch('api/workspaces',{cache:'no-store'});
+    if(response.status===404){window.location.replace('/');return;}
     if(!response.ok)throw Error('Не удалось загрузить страницы.');
     const data=await response.json();
     $('workspaceNew').disabled=workspaceCreating||data.pages.length>=data.limit;
@@ -361,12 +362,36 @@ async function refreshWorkspaces(){
       const status=document.createElement('small');
       status.className=page.monitoring?'ok':'muted';
       status.textContent=page.monitoring?'● Мониторинг активен':['dns','checking','saving','key'].includes(page.phase)?'Выполняется проверка':page.phase==='error'?'Ошибка проверки':page.host?'Готов к проверке':'Новая страница';
-      a.append(label,status);$('workspaceTabs').append(a);
+      a.append(label,status);
+      const card=document.createElement('div');card.className='workspace-card';
+      const close=document.createElement('button');
+      close.type='button';close.className='secondary workspace-delete';close.textContent='×';
+      close.setAttribute('aria-label','Удалить страницу '+label.textContent);
+      close.title='Удалить страницу прокси';
+      close.onclick=()=>deleteWorkspace(page,data.current,label.textContent);
+      card.append(a,close);$('workspaceTabs').append(card);
     });
   }catch(e){$('workspaceMessage').textContent=e.message;}finally{workspacePolling=false;}
 }
+async function deleteWorkspace(page,current,label){
+  if(workspaceDeleting||workspaceCreating)return;
+  if(!window.confirm('Удалить страницу «'+label+'»? Её мониторинг остановится. DNS и общий архив IPv4 не изменятся.'))return;
+  workspaceDeleting=true;
+  $('workspaceMessage').textContent='';
+  try{
+    const response=await fetch('/w/'+encodeURIComponent(page.id)+'/api/workspaces/delete',{
+      method:'POST',headers:{'Content-Type':'application/json','X-Local-Token':token},body:'{}'});
+    const result=await response.json();
+    if(!response.ok)throw Error(result.error||'Не удалось удалить страницу.');
+    if(result.warning)window.alert(result.warning);
+    if(page.id===current){window.location.replace('/w/'+encodeURIComponent(result.next)+'/');return;}
+    workspaceListSignature='';
+    await refreshWorkspaces();
+  }catch(e){$('workspaceMessage').textContent=e.message;workspaceListSignature='';await refreshWorkspaces();}
+  finally{workspaceDeleting=false;}
+}
 $('workspaceNew').onclick=async()=>{
-  if(workspaceCreating)return;
+  if(workspaceCreating||workspaceDeleting)return;
   workspaceCreating=true;$('workspaceNew').disabled=true;
   try{
     const result=await post('/api/workspaces',{});

@@ -11,6 +11,7 @@ import webbrowser
 from http.server import ThreadingHTTPServer
 
 import web_app as base
+import workspace_lifecycle
 
 ROOT = base.ROOT
 WORKSPACES = base.CONFIG.parent / 'workspaces'
@@ -94,6 +95,7 @@ def shared_settings_busy():
 
 
 def wire(module, page_id):
+    module.REQUEST_LOCK = threading.RLock()
     module.API = SharedAPI
     module.TOKEN = base.TOKEN
     original_scan = module.start_scan
@@ -102,6 +104,8 @@ def wire(module, page_id):
 
     def start_scan(body, generation=None):
         with CONTROL:
+            if module.WORKSPACE_CLOSED.is_set():
+                raise ValueError('Страница удалена.')
             link = body.get('link','')
             try:
                 target = module.parse_link(link) if isinstance(link,str) and link else module.LAST
@@ -113,6 +117,8 @@ def wire(module, page_id):
 
     def monitor_operation(path, body):
         with CONTROL:
+            if module.WORKSPACE_CLOSED.is_set():
+                raise ValueError('Страница удалена.')
             if path.endswith('/start') and module.LAST:
                 require_unique(module.LAST[0], page_id)
             return original_monitor(path, body)
@@ -140,6 +146,8 @@ def wire(module, page_id):
 
 def load_page(page_id):
     """Caller holds CONTROL. Each page owns an independent module namespace."""
+    if workspace_lifecycle.retired(WORKSPACES,page_id):
+        raise ValueError('Страница удалена.')
     if page_id == 'main':
         module = base
     else:
@@ -174,6 +182,8 @@ def create_page():
         WORKSPACES.mkdir(parents=True,exist_ok=True,mode=0o700)
         while True:
             page_id=secrets.token_hex(6)
+            if workspace_lifecycle.retired(WORKSPACES,page_id):
+                continue
             try:
                 (WORKSPACES/page_id).mkdir(mode=0o700)
                 break
@@ -201,8 +211,13 @@ class Router(base.Handler):
             self.out({'error':'Invalid host'},403)
             return None
         if self.path=='/':
+            with CONTROL:
+                page_id=next(iter(PAGES),None)
+            if page_id is None:
+                self.out({'error':'Нет рабочих страниц.'},503)
+                return None
             self.send_response(302)
-            self.send_header('Location','/w/main/')
+            self.send_header('Location','/w/'+page_id+'/')
             self.send_header('Content-Length','0')
             self.end_headers()
             return None
@@ -214,7 +229,13 @@ class Router(base.Handler):
         with CONTROL:
             module=PAGES.get(page_id)
         if module is None:
-            self.out({'error':'Страница не найдена.'},404)
+            if path=='/' and self.command=='GET':
+                self.send_response(302)
+                self.send_header('Location','/')
+                self.send_header('Content-Length','0')
+                self.end_headers()
+            else:
+                self.out({'error':'Страница не найдена.'},404)
             return None
         self.path=path
         return page_id,module
@@ -237,14 +258,25 @@ class Router(base.Handler):
         origin='http://127.0.0.1:'+str(self.server.server_port)
         if self.headers.get('Origin')!=origin or self.headers.get('X-Local-Token')!=base.TOKEN:
             return self.out({'error':'Forbidden'},403)
+        with module.REQUEST_LOCK:
+            with CONTROL:
+                if PAGES.get(page_id) is not module:
+                    return self.out({'error':'Страница удалена.'},404)
+            return self.dispatch_post(page_id,module)
+
+    def dispatch_post(self,page_id,module):
         try:
-            if self.path=='/api/workspaces':
+            if self.path in ('/api/workspaces','/api/workspaces/delete'):
                 n=int(self.headers.get('Content-Length','0'))
                 if not 0<n<=1024 or self.headers.get_content_type()!='application/json':
                     raise ValueError('Некорректный запрос.')
                 body=json.loads(self.rfile.read(n))
                 if body!={}:
                     raise ValueError('Некорректный запрос.')
+                if self.path=='/api/workspaces/delete':
+                    with CONTROL:
+                        result=workspace_lifecycle.remove_page(WORKSPACES,PAGES,page_id,create_page,base.dynadot.private_write)
+                    return self.out(result)
                 return self.out({'id':create_page()},201)
             if self.path in ('/api/key','/api/dynadot/config'):
                 with CONTROL:
@@ -281,16 +313,19 @@ def main():
     try:
         install_shared_locks()
         with CONTROL:
-            load_page('main')
+            if not workspace_lifecycle.retired(WORKSPACES,'main'):
+                load_page('main')
             if WORKSPACES.is_dir():
                 for directory in sorted(WORKSPACES.iterdir()):
-                    if directory.is_dir() and ID_PATTERN.fullmatch(directory.name):
+                    if directory.is_dir() and ID_PATTERN.fullmatch(directory.name) and not workspace_lifecycle.retired(WORKSPACES,directory.name):
                         if len(PAGES)>=LIMIT:
                             break
                         load_page(directory.name)
             for module in PAGES.values():
                 start_worker(module)
-        url='http://127.0.0.1:'+str(server.server_port)+'/w/main/'
+            if not PAGES:
+                create_page()
+        url='http://127.0.0.1:'+str(server.server_port)+'/'
         print('Локальный dashboard: '+url+'\nДля остановки нажмите Ctrl+C.')
         if not args.no_browser:
             threading.Thread(target=webbrowser.open,args=(url,),daemon=True).start()

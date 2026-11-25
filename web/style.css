@@ -10,3 +10,5 @@
 .monitor-settings{display:grid;gap:10px;margin:16px 0 20px;padding:14px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}#monitorInterval{width:100px}.monitor-option{display:flex;align-items:center;gap:9px;font-weight:550}.monitor-option input{margin:0}
 
 .history-stats{padding:12px 14px;margin-bottom:16px;border:1px solid var(--line);border-radius:10px;color:var(--muted);background:#101a29}#ipHistory .controls{margin-bottom:16px}#ipHistory td small{display:block}
+
+.workspace-card{display:flex;align-items:stretch;position:relative;max-width:100%}.workspace-card .workspace-tab{padding-right:44px;flex:1}.workspace-delete{position:absolute;right:5px;top:5px;width:30px;height:30px;padding:0;border:0;background:transparent;color:var(--muted);font-size:21px;line-height:1}.workspace-delete:hover{color:var(--bad);background:#38212c;transform:none}.workspace-delete:focus-visible{outline:2px solid var(--accent)}

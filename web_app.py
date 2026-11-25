@@ -31,6 +31,7 @@ PROTECTED = CONFIG.parent / 'protected_ipv4.json'
 HISTORY = CONFIG.parent / 'ipv4_history.sqlite3'
 TOKEN = secrets.token_urlsafe(32)
 LOCK = threading.Lock()
+WORKSPACE_CLOSED = threading.Event()
 MONITOR = Monitor()
 ACTIVE_PHASES = ('dns','checking','saving','key')
 STATE = {'phase':'idle','rows':[], 'ips':[], 'host':'', 'port':None, 'source':'',
@@ -440,8 +441,7 @@ def monitor_operation(path,body):
         return MONITOR.public(time.monotonic())
 
 def monitor_loop():
-    while True:
-        time.sleep(0.5)
+    while not WORKSPACE_CLOSED.wait(0.5):
         with LOCK:
             if not MONITOR.due(time.monotonic(),STATE['phase'] in ACTIVE_PHASES):
                 continue
