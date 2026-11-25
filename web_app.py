@@ -3,6 +3,7 @@ import argparse
 import dynadot_dns as dynadot
 import dynadot_add as dns_add
 import auto_dns
+from monitor_cycle import Monitor, INTERVAL
 import copy
 import csv
 import io
@@ -26,6 +27,8 @@ LAST_PROXY = CONFIG.parent / 'last_proxy.json'
 PROTECTED = CONFIG.parent / 'protected_ipv4.json'
 TOKEN = secrets.token_urlsafe(32)
 LOCK = threading.Lock()
+MONITOR = Monitor()
+ACTIVE_PHASES = ('dns','checking','saving','key')
 STATE = {'phase':'idle','rows':[], 'ips':[], 'host':'', 'port':None, 'source':'',
          'current':'', 'done':0, 'total':0, 'error':'', 'started_at':'', 'finished_at':'', 'scan_id':'', 'auto_result':None}
 LAST = None
@@ -117,7 +120,7 @@ def save_report():
         save_target(LAST_PROXY,report,LAST)
     os.replace(tmp,REPORTS/'latest.json')
 
-def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected):
+def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected,generation=None,target=None):
     selected,reason=auto_dns.plan(ips,rows,protected)
     result={'status':'skipped','message':reason,'removed':[],'protected':sorted(protected & set(ips))}
     if not selected:
@@ -130,7 +133,17 @@ def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected):
             raise ValueError('DNS-зона изменилась.')
         result.update(status='checking',message='Удаление подтверждённых недоступных IPv4…')
         change(auto_result=dict(result))
-        deleted=dynadot.remove(c,sub,zone,selected)
+        if generation is not None:
+            with LOCK:
+                if not MONITOR.matches(generation,target):
+                    return dict(result,status='skipped',message='Мониторинг остановлен до удаления.')
+                MONITOR.committing=True
+        try:
+            deleted=dynadot.remove(c,sub,zone,selected)
+        finally:
+            if generation is not None:
+                with LOCK:
+                    MONITOR.committing=False
         result.update(status='removed',message='Удаление подтверждено Dynadot.',
                       removed=deleted['removed'],backup=deleted['backup'],
                       measurements=[r for r in rows if r['ip'] in selected])
@@ -139,11 +152,15 @@ def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected):
                done=len(remaining),total=len(remaining),
                source='Dynadot API (после автоудаления; DNS-кэш может отличаться)')
     except Exception as e:
+        if generation is not None:
+            with LOCK:
+                if MONITOR.matches(generation,target):
+                    MONITOR.stop('Мониторинг остановлен: результат удаления не подтверждён.')
         result.update(status='error',message='Автоудаление не подтверждено: '+str(e)+
                       ' Обновите DNS-список вручную. Автоматического повтора нет.')
     return result
 
-def run_scan(target, timeout, repeat, chosen=None, auto=False):
+def run_scan(target, timeout, repeat, chosen=None, auto=False, generation=None):
     host,port,secret = target
     try:
         api = client()
@@ -165,6 +182,11 @@ def run_scan(target, timeout, repeat, chosen=None, auto=False):
             ips = chosen
             change(total=len(ips),phase='checking')
         for i,ip in enumerate(ips,1):
+            if generation is not None:
+                with LOCK:
+                    if not MONITOR.matches(generation,target):
+                        STATE.update(phase='error',error='Мониторинг остановлен. Проверка прервана без автоудаления.',current='',finished_at=now())
+                        return
             change(current=ip)
             first = safe_result(api,ip,port,secret,timeout)
             second = None
@@ -185,7 +207,7 @@ def run_scan(target, timeout, repeat, chosen=None, auto=False):
             protected=auto_dns.release_healthy(PROTECTED,host,[r for r in rows if r['ip'] in ips],dynadot.private_write)
             if auto:
                 change(current='Проверка условий автоудаления')
-                change(auto_result=apply_auto_cleanup(c,sub,zone,host,ips,rows,protected))
+                change(auto_result=apply_auto_cleanup(c,sub,zone,host,ips,rows,protected,generation,target))
         except (ValueError,OSError) as exc:
             if auto:
                 change(auto_result={'status':'skipped','message':str(exc),'removed':[]})
@@ -210,7 +232,7 @@ def run_scan(target, timeout, repeat, chosen=None, auto=False):
     except Exception:
         change(phase='error',error='Внутренняя ошибка проверки. Частичные результаты сохранены в памяти.',current='',finished_at=now())
 
-def start_scan(body):
+def start_scan(body,generation=None):
     global DNS_PREVIEW, ADD_PREVIEW, LAST
     link = body.get('link','')
     if not isinstance(link,str) or len(link)>8192:
@@ -226,7 +248,11 @@ def start_scan(body):
     if auto and dynadot.config()['mode']!='production':
         raise ValueError('Автоудаление доступно только для Production.')
     with LOCK:
-        if STATE['phase'] in ('dns','checking','saving','key'):
+        if MONITOR.enabled and generation is None:
+            raise ValueError('Остановите мониторинг перед ручной проверкой.')
+        if generation is not None and not MONITOR.matches(generation,LAST):
+            raise ValueError('Мониторинг остановлен или прокси изменился.')
+        if STATE['phase'] in ACTIVE_PHASES:
             raise ValueError('Дождитесь завершения текущей операции.')
         if not CONFIG.is_file():
             raise ValueError('Сначала сохраните API-ключ.')
@@ -264,7 +290,46 @@ def start_scan(body):
         STATE.update(done=0,current='',error='',started_at=now(),finished_at='',auto_result=None)
         DNS_PREVIEW = None
         ADD_PREVIEW = None
-    threading.Thread(target=run_scan,args=(target,timeout,repeat,chosen,auto),daemon=True).start()
+        if generation is not None:
+            MONITOR.started(time.monotonic())
+    threading.Thread(target=run_scan,args=(target,timeout,repeat,chosen,auto,generation),daemon=True).start()
+
+def monitor_operation(path,body):
+    with LOCK:
+        if path=='/api/monitor/stop':
+            committing=MONITOR.committing
+            MONITOR.stop('Мониторинг остановлен. Уже начатая DNS-операция завершится.' if committing else 'Мониторинг остановлен. Новые удаления не запускаются.')
+            return MONITOR.public(time.monotonic())
+        if STATE['phase'] in ACTIVE_PHASES:
+            raise ValueError('Дождитесь завершения текущей операции.')
+        if LAST is None or LAST[:2]!=(STATE['host'],STATE['port']):
+            raise ValueError('Сначала выполните проверку нужного прокси.')
+        if body.get('host')!=LAST[0] or body.get('port')!=LAST[1]:
+            raise ValueError('Текущий прокси изменился. Обновите страницу.')
+        if not CONFIG.is_file() or dynadot.config()['mode']!='production':
+            raise ValueError('Нужны действующие API-ключи проверки и Production Dynadot.')
+        timeout=body.get('timeout',10)
+        if type(timeout) is not int or not 1<=timeout<=15:
+            raise ValueError('Некорректный таймаут.')
+        auto_dns.read_protected(PROTECTED)
+        MONITOR.start(LAST,timeout,time.monotonic())
+        return MONITOR.public(time.monotonic())
+
+def monitor_loop():
+    while True:
+        time.sleep(0.5)
+        with LOCK:
+            if not MONITOR.due(time.monotonic(),STATE['phase'] in ACTIVE_PHASES):
+                continue
+            generation=MONITOR.generation
+            timeout=MONITOR.timeout
+        try:
+            start_scan({'mode':'all','link':'','timeout':timeout,'repeat':True,'auto_cleanup':True},generation)
+        except (ValueError,OSError) as exc:
+            with LOCK:
+                if MONITOR.enabled and MONITOR.generation==generation and STATE['phase'] not in ACTIVE_PHASES:
+                    MONITOR.next_due=time.monotonic()+INTERVAL
+                    MONITOR.message=str(exc)
 
 def dns_operation(path,body):
     global DNS_PREVIEW, ADD_PREVIEW
@@ -276,6 +341,9 @@ def dns_operation(path,body):
         STATE['phase']='key'
     try:
         if path=='/api/dynadot/config':
+            with LOCK:
+                if MONITOR.enabled:
+                    raise ValueError('Остановите мониторинг перед сменой ключей Dynadot.')
             DNS_PREVIEW=None
             ADD_PREVIEW=None
             return dynadot.save_config(body)
@@ -390,6 +458,7 @@ class Handler(BaseHTTPRequestHandler):
             data['has_key'] = CONFIG.is_file()
             data['dynadot'] = dynadot.public_config()
             with LOCK:
+                data['monitor'] = MONITOR.public(time.monotonic())
                 data['can_repeat'] = LAST is not None and (LAST[0],LAST[1]) == (STATE['host'],STATE['port'])
             self.out(data)
         elif self.path == '/export.json':
@@ -412,12 +481,16 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('Некорректный запрос.')
             if self.path in ('/api/dynadot/config','/api/dynadot/preview','/api/dynadot/delete','/api/dynadot/add-preview','/api/dynadot/add'):
                 self.out(dns_operation(self.path,body))
+            elif self.path in ('/api/monitor/start','/api/monitor/stop'):
+                self.out(monitor_operation(self.path,body))
             elif self.path == '/api/check':
                 start_scan(body)
                 self.out({'ok':True},202)
             elif self.path == '/api/key':
                 with LOCK:
-                    if STATE['phase'] in ('dns','checking','saving','key'):
+                    if MONITOR.enabled:
+                        raise ValueError('Остановите мониторинг перед сменой API-ключа.')
+                    if STATE['phase'] in ACTIVE_PHASES:
                         raise ValueError('Дождитесь завершения текущей операции.')
                     old = STATE['phase']
                     STATE['phase'] = 'key'
@@ -456,6 +529,7 @@ def main():
         return 1
     url = 'http://127.0.0.1:'+str(server.server_port)
     print('Локальный dashboard: '+url+'\nДля остановки нажмите Ctrl+C.')
+    threading.Thread(target=monitor_loop,daemon=True).start()
     if not args.no_browser:
         threading.Thread(target=webbrowser.open,args=(url,),daemon=True).start()
     try:
@@ -463,6 +537,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        with LOCK:
+            MONITOR.stop()
         server.server_close()
     return 0
 

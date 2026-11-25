@@ -25,7 +25,10 @@ async function run(mode='all',ip=null){
 function active(){return ['dns','checking','saving','key'].includes(state.phase);}
 function buttons(){
   dnsButtons();
-  const lock=busy||active();
+  const monitoring=!!state.monitor?.enabled;
+  const lock=busy||active()||monitoring;
+  $('monitorStart').disabled=lock||!state.has_key||!state.can_repeat||!state.dynadot?.configured||state.dynadot.mode!=='production'||!!state.monitor?.committing;
+  $('monitorStop').disabled=!monitoring;
   $('start').disabled=lock||!state.has_key;
   $('autoCleanup').disabled=lock||!state.dynadot?.configured||state.dynadot.mode!=='production';
   if(!state.dynadot?.configured||state.dynadot.mode!=='production')$('autoCleanup').checked=false;
@@ -68,6 +71,11 @@ document.addEventListener('click',e=>{
 function render(){
   dnsRender();
   const p=state.phase;
+  const m=state.monitor||{};
+  $('monitorTarget').textContent='Прокси: '+(m.enabled?m.host+':'+m.port:state.host?state.host+':'+state.port:'—');
+  $('monitorStatus').textContent=m.enabled?'Активен · автоудаление':'Остановлен';
+  $('monitorNext').textContent=m.enabled?(active()?'Проверка выполняется':'Следующая проверка через '+Math.floor((m.seconds||0)/60)+':'+String((m.seconds||0)%60).padStart(2,'0')):'';
+  $('monitorMessage').textContent=m.message||'';
   const ar=state.auto_result;
   $('autoResult').textContent=ar?'Автоудаление: '+ar.message+(ar.removed?.length?' Удалены: '+ar.removed.join(', '):'')+(ar.protected?.length?' Защищены: '+ar.protected.join(', '):'')+(ar.backup?' Резервная копия: '+ar.backup:''):'';
   $('savedLinkHint').textContent=state.can_repeat?'Сохранённый прокси: '+state.host+':'+state.port+'. Оставьте поле пустым для повторной проверки или вставьте новую ссылку.':state.rows.length?'Для старого отчёта ссылка не сохранена. Введите её и запустите проверку один раз.':'Ссылка сохраняется локально после завершённой проверки.';
@@ -105,7 +113,7 @@ async function poll(){
 let dns=null,dnsBusy=false,dnsFingerprint='',dnsSelection=[],addition=null,addSelection=[];
 const dnsMsg=v=>{$('dnsMessage').textContent=v;};
 function dnsButtons(){
-  const lock=busy||dnsBusy||active();
+  const lock=busy||dnsBusy||active()||!!state.monitor?.enabled;
   $('dnsLoad').disabled=lock||!state.dynadot?.configured||state.phase!=='done';
   $('dnsConfig').querySelector('button').disabled=lock;
   $('start').disabled=lock||!state.has_key;
@@ -172,7 +180,7 @@ $('dnsApply').onclick=()=>{
 };
 function clearAddition(){addition=null;$('addPreview').hidden=true;}
 const addMsg=v=>{$('addMessage').textContent=v;};
-function addButtons(lock=busy||dnsBusy||active()){
+function addButtons(lock=busy||dnsBusy||active()||!!state.monitor?.enabled){
   const ready=!!state.dynadot?.configured&&state.phase==='done'&&!!state.host;
   $('addCheck').disabled=lock||!ready||!$('addIps').value.trim();
   $('addIps').disabled=lock;
@@ -217,5 +225,15 @@ $('addApply').onclick=()=>{
       try{await loadDns();}catch(e){dnsMsg('Записи добавлены, но обновление таблицы не удалось: '+e.message);}
     }catch(e){addMsg(e.message);}
   });
+};
+$('monitorStart').onclick=async()=>{
+  if($('link').value.trim()){message('Сначала проверьте новую ссылку, затем запустите мониторинг.');return;}
+  if(!window.confirm('Запустить мониторинг '+state.host+':'+state.port+' каждые 2 минуты с автоматическим удалением дважды недоступных из РФ A-записей?'))return;
+  busy=true;buttons();
+  try{await post('/api/monitor/start',{host:state.host,port:state.port,timeout:Number($('timeout').value)});await poll();}
+  catch(e){message(e.message);}finally{busy=false;buttons();}
+};
+$('monitorStop').onclick=async()=>{
+  try{await post('/api/monitor/stop',{});await poll();}catch(e){message(e.message);}
 };
 poll();setInterval(poll,1000);
