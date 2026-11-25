@@ -9,7 +9,7 @@ const action={KEEP:'Оставить',REVIEW_DNS:'Проверить DNS/VPS',RE
 const fmt=v=>v===true?'Да':v===false?'Нет':v??'—';
 const message=(s)=>{$('message').textContent=s;};
 async function post(path,data){
-  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Local-Token':token},body:JSON.stringify(data)});
+  const r=await fetch(path.replace(/^\//,''),{method:'POST',headers:{'Content-Type':'application/json','X-Local-Token':token},body:JSON.stringify(data)});
   const j=await r.json();if(!r.ok)throw Error(j.error||'Ошибка запроса');return j;
 }
 async function run(mode='all',ip=null){
@@ -107,7 +107,7 @@ function render(){
 let polling=false;
 async function poll(){
   if(polling)return;
-  polling=true;try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error();state=await r.json();render();}
+  polling=true;try{const r=await fetch('api/state',{cache:'no-store'});if(!r.ok)throw Error();state=await r.json();render();}
   catch(e){message('Нет связи с локальным сервером. Проверьте окно терминала.');}finally{polling=false;}
 }
 let dns=null,dnsBusy=false,dnsFingerprint='',dnsSelection=[],addition=null,addSelection=[];
@@ -236,4 +236,43 @@ $('monitorStart').onclick=async()=>{
 $('monitorStop').onclick=async()=>{
   try{await post('/api/monitor/stop',{});await poll();}catch(e){message(e.message);}
 };
+let workspaceListSignature='',workspaceCreating=false,workspacePolling=false;
+async function refreshWorkspaces(){
+  if(workspacePolling)return;
+  workspacePolling=true;
+  try{
+    const response=await fetch('api/workspaces',{cache:'no-store'});
+    if(!response.ok)throw Error('Не удалось загрузить страницы.');
+    const data=await response.json();
+    $('workspaceNew').disabled=workspaceCreating||data.pages.length>=data.limit;
+    const signature=JSON.stringify(data);
+    if(signature===workspaceListSignature)return;
+    workspaceListSignature=signature;
+    $('workspaceTabs').replaceChildren();
+    data.pages.forEach((page,index)=>{
+      const a=document.createElement('a');
+      a.className='workspace-tab'+(page.id===data.current?' current':'');
+      a.href='/w/'+encodeURIComponent(page.id)+'/';
+      if(page.id===data.current)a.setAttribute('aria-current','page');
+      const label=document.createElement('strong');
+      label.textContent=page.host?page.host+(page.port?':'+page.port:''):'Прокси '+(index+1);
+      const status=document.createElement('small');
+      status.className=page.monitoring?'ok':'muted';
+      status.textContent=page.monitoring?'● Мониторинг активен':['dns','checking','saving','key'].includes(page.phase)?'Выполняется проверка':page.phase==='error'?'Ошибка проверки':page.host?'Готов к проверке':'Новая страница';
+      a.append(label,status);$('workspaceTabs').append(a);
+    });
+  }catch(e){$('workspaceMessage').textContent=e.message;}finally{workspacePolling=false;}
+}
+$('workspaceNew').onclick=async()=>{
+  if(workspaceCreating)return;
+  workspaceCreating=true;$('workspaceNew').disabled=true;
+  try{
+    const result=await post('/api/workspaces',{});
+    window.location.assign('/w/'+encodeURIComponent(result.id)+'/');
+  }catch(e){
+    $('workspaceMessage').textContent=e.message;workspaceCreating=false;
+    await refreshWorkspaces();
+  }
+};
+refreshWorkspaces();setInterval(refreshWorkspaces,2000);
 poll();setInterval(poll,1000);
