@@ -16,8 +16,31 @@ class DynadotListTests(unittest.TestCase):
         self.assertEqual(req.call_args_list[1].kwargs['path'],'/restful/v2/domains?page=2')
 
     @patch('dynadot_dns.request')
-    def test_missing_pagination_fails_closed(self,req):
+    def test_missing_pagination_uses_explicit_pages(self,req):
+        page={'domain_info_list':[{'domain_name':'example.com'}]}
+        req.side_effect=[page,page,{'domain_info_list':[]}]
+        self.assertEqual(d.list_domains(C),['example.com'])
+        self.assertEqual(req.call_args_list[1].kwargs['path'],'/restful/v2/domains?page=1&page_size=100')
+        self.assertEqual(req.call_args_list[2].kwargs['path'],'/restful/v2/domains?page=2&page_size=100')
+
+    @patch('dynadot_dns.request')
+    def test_string_pagination(self,req):
+        req.side_effect=[
+            {'domain_info_list':[{'domain_name':'example.com'}],'pagination_result':{'page':'1','total':'2','has_next_page':'true'}},
+            {'domain_info_list':[{'domain_name':'example.net'}],'pagination_result':{'page':'2','total':'2','has_next_page':'false'}},
+        ]
+        self.assertEqual(d.list_domains(C),['example.com','example.net'])
+
+    @patch('dynadot_dns.request')
+    def test_repeated_pages_fail_closed(self,req):
         req.return_value={'domain_info_list':[{'domain_name':'example.com'}]}
+        with self.assertRaises(ValueError):
+            d.list_domains(C)
+
+    @patch('dynadot_dns.request')
+    def test_incomplete_list_fails_closed(self,req):
+        req.return_value={'domain_info_list':[{'domain_name':'example.com'}],
+                          'pagination_result':{'page':1,'total':2,'has_next_page':False}}
         with self.assertRaises(ValueError):
             d.list_domains(C)
 

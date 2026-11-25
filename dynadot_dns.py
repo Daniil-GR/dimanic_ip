@@ -176,34 +176,96 @@ def error_message(raw,c,signature):
             v=v.replace(secret,'[скрыто]')
     return ' '.join(v.split())[:500]
 
+def pagination_int(value):
+    if type(value) is int and value>=0:
+        return value
+    if isinstance(value,str) and re.fullmatch(r'[0-9]{1,12}',value):
+        return int(value)
+    return None
+
+def pagination_bool(value):
+    if type(value) is bool:
+        return value
+    if type(value) is int and value in (0,1):
+        return bool(value)
+    if isinstance(value,str):
+        v=value.strip().lower()
+        if v in ('true','1','yes'):
+            return True
+        if v in ('false','0','no'):
+            return False
+    return None
+
+def domain_page(data):
+    rows=data.get('domain_info_list')
+    if not isinstance(rows,list):
+        raise ValueError('Dynadot: неизвестная структура списка доменов.')
+    names={domain(r['domain_name']) for r in rows if isinstance(r,dict) and isinstance(r.get('domain_name'),str)}
+    if len(names)!=len(rows):
+        raise ValueError('Dynadot: неполный или повторяющийся список доменов.')
+    return names
+
+def pagination_shape(data):
+    # Only names of known schema fields and their types, never actual domain or account data.
+    p=data.get('pagination_result')
+    if isinstance(p,dict):
+        return ', '.join(k+':'+type(p[k]).__name__ for k in ('page','page_size','total','has_next_page') if k in p) or 'пустой объект'
+    return type(p).__name__
+
 def list_domains(c):
+    endpoint='/restful/v2/domains'
+    first=request(c,'GET',path=endpoint)
+    first_names=domain_page(first)
+    pagination=first.get('pagination_result')
+    # A default request may omit metadata or return string values. If the
+    # response does not establish the last page, restart with explicit paging.
+    explicit=not isinstance(pagination,dict) or (
+        pagination_bool(pagination.get('has_next_page')) is None
+        and pagination_int(pagination.get('total')) is None)
     found=set()
+    size=100
     for page in range(1,501):
-        # Start with the exact documented default request. No optional filters.
-        path='/restful/v2/domains'
-        if page>1:
-            path+='?'+urlencode({'page':page})
-        data=request(c,'GET',path=path)
-        rows=data.get('domain_info_list')
-        if not isinstance(rows,list):
-            raise ValueError('Dynadot: неизвестная структура списка доменов.')
-        names={domain(r['domain_name']) for r in rows if isinstance(r,dict) and isinstance(r.get('domain_name'),str)}
-        if len(names)!=len(rows):
-            raise ValueError('Dynadot: неполный или повторяющийся список доменов.')
+        if explicit:
+            path=endpoint+'?'+urlencode({'page':page,'page_size':size})
+            data=request(c,'GET',path=path)
+        elif page==1:
+            data=first
+        else:
+            path=endpoint+'?'+urlencode({'page':page})
+            data=request(c,'GET',path=path)
+        names=domain_page(data)
         if names & found:
             raise ValueError('Dynadot: повтор страниц списка доменов. Изменение DNS запрещено.')
         found.update(names)
-        pagination=data.get('pagination_result')
-        if not isinstance(pagination,dict) or type(pagination.get('has_next_page')) is not bool:
-            raise ValueError('Dynadot: нет достоверной пагинации списка доменов. Изменение DNS запрещено.')
-        if pagination.get('page')!=page:
+        p=data.get('pagination_result')
+        p=p if isinstance(p,dict) else {}
+        number=pagination_int(p.get('page'))
+        total=pagination_int(p.get('total'))
+        more=pagination_bool(p.get('has_next_page'))
+        page_size=pagination_int(p.get('page_size'))
+        if number is not None and number!=page:
             raise ValueError('Dynadot: неожиданный номер страницы.')
-        if not pagination['has_next_page']:
-            if type(pagination.get('total')) is int and len(found)!=pagination['total']:
-                raise ValueError('Dynadot: количество доменов не совпало с итогом пагинации.')
+        if total is not None:
+            if len(found)>total or (more is False and len(found)!=total) or (more is True and len(found)>=total):
+                raise ValueError('Dynadot: противоречивые сведения о пагинации.')
+            if more is None:
+                more=len(found)<total
+        if more is None and explicit:
+            effective=page_size or size
+            if not 1<=effective<=size or len(names)>effective:
+                raise ValueError('Dynadot: неожиданный размер страницы.')
+            # Without metadata, do not assume a short page is final: request
+            # another page and require an empty response or explicit end.
+            if not names:
+                more=False
+            else:
+                more=True
+        if more is False:
+            if not first_names<=found:
+                raise ValueError('Dynadot: список доменов изменился между запросами. Повторите подключение.')
             return sorted(found)
-        if not rows:
-            raise ValueError('Dynadot: пустая промежуточная страница.')
+        if more is None or not names:
+            raise ValueError('Dynadot: неизвестная пагинация ('+pagination_shape(data)+'). Изменение DNS запрещено.')
     raise ValueError('Слишком много страниц Dynadot. Изменение DNS запрещено.')
 
 def select_zone(host,domains):
