@@ -51,6 +51,7 @@ def install_shared_locks():
     base.dns_add.append_records = serialized(base.dns_add.append_records, DNS_LOCK)
     base.auto_dns.protect = serialized(base.auto_dns.protect, PROTECTION_LOCK)
     base.auto_dns.release_healthy = serialized(base.auto_dns.release_healthy, PROTECTION_LOCK)
+    base.auto_dns.release_protection = serialized(base.auto_dns.release_protection, PROTECTION_LOCK)
 
 
 def restore(module):

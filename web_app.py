@@ -125,6 +125,22 @@ def pause_operation(body):
             STATE['rows']=[pending_row(ip,STATE['port']) if r['ip']==ip and r.get('api_status')!='NOT_TESTED' else r for r in STATE['rows']]
         return {'host':host,'paused':sorted(result)}
 
+def release_protection_operation(body):
+    global PAUSE_REV
+    with LOCK:
+        if PAUSE_COMMIT or STATE['phase'] in ('key','saving'):
+            raise ValueError('DNS-операция или сохранение уже начались. Повторите после завершения.')
+        host=STATE['host']
+        ip=body.get('ip')
+        if not host or body.get('host')!=host or not isinstance(ip,str) or ip not in STATE['ips'] or body.get('confirm') is not True:
+            raise ValueError('Подтвердите снятие защиты адреса текущего пула.')
+        if ip in paused(host):
+            raise ValueError('Сначала возобновите проверку IPv4.')
+        current=auto_dns.release_protection(PROTECTED,host,ip,dynadot.private_write)
+        PAUSE_REV+=1  # No DNS mutation using measurements from before the change.
+        STATE['rows']=[pending_row(ip,STATE['port']) if r['ip']==ip else r for r in STATE['rows']]
+        return {'host':host,'protected':sorted(current)}
+
 def csv_bytes(rows):
     f = io.StringIO(newline='')
     if rows:
@@ -529,6 +545,11 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     data['paused'] = []
                     data['pause_error'] = str(exc)
+                try:
+                    data['protected'] = sorted(auto_dns.read_protected(PROTECTED).get(STATE['host'],[]))
+                except ValueError as exc:
+                    data['protected'] = []
+                    data['protection_error'] = str(exc)
                 data['can_repeat'] = LAST is not None and (LAST[0],LAST[1]) == (STATE['host'],STATE['port'])
             self.out(data)
         elif self.path == '/export.json':
@@ -555,6 +576,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.out(monitor_operation(self.path,body))
             elif self.path == '/api/ipv4/pause':
                 self.out(pause_operation(body))
+            elif self.path == '/api/ipv4/release-protection':
+                self.out(release_protection_operation(body))
             elif self.path == '/api/check':
                 start_scan(body)
                 self.out({'ok':True},202)

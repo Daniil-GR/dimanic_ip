@@ -37,6 +37,19 @@ def release_healthy(path, host, rows, write):
     return current
 
 
+def release_protection(path, host, ip, write):
+    data = read_protected(path)
+    current = set(data.get(host, []))
+    if ip in current:
+        current.remove(ip)
+        if current:
+            data[host] = sorted(current)
+        else:
+            data.pop(host, None)
+        write(path, data)
+    return current
+
+
 def plan(ips, rows, protected):
     expected = set(ips)
     indexed = {r['ip']: r for r in rows}
@@ -50,4 +63,11 @@ def plan(ips, rows, protected):
                 indexed[ip].get('first_ru_data') is False and
                 indexed[ip].get('local_data') is False and
                 indexed[ip].get('recheck') in ('RKN_BLOCK','DATA_CUT','MT_DEAD','DOWN','UNKNOWN')]
-    return selected, '' if selected else 'Нет подтверждённых недоступных IP без защиты.'
+    if selected:
+        return selected, ''
+    blocked = [ip for ip in ips if ip in protected and
+               indexed[ip].get('first_ru_data') is False and
+               indexed[ip].get('local_data') is False]
+    if blocked:
+        return [], 'Дважды недоступные IP защищены как новые VPS: '+', '.join(blocked)+'. Снимите защиту в таблице, когда настройка завершена.'
+    return [], 'Нет подтверждённых недоступных IP без защиты.'
