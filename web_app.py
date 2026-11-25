@@ -1,6 +1,7 @@
 """Local browser dashboard. Start with python web_app.py."""
 import argparse
 import dynadot_dns as dynadot
+import dynadot_add as dns_add
 import copy
 import csv
 import io
@@ -28,6 +29,7 @@ STATE = {'phase':'idle','rows':[], 'ips':[], 'host':'', 'port':None, 'source':''
 LAST = None
 CLIENT = None
 DNS_PREVIEW = None
+ADD_PREVIEW = None
 FIELDS = ('tcp','handshake','data','ssh','ping_ms','latency_ms','duration_ms')
 
 def now():
@@ -101,6 +103,7 @@ def snapshot():
 
 def save_report():
     report = snapshot()
+    report['phase'] = 'done'
     REPORTS.mkdir(parents=True,exist_ok=True,mode=0o700)
     stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')
     for name,data in [('proxy-check-'+stamp+'.json',json.dumps(report,ensure_ascii=False,indent=2).encode()),
@@ -108,6 +111,8 @@ def save_report():
         (REPORTS/name).write_bytes(data)
     tmp = REPORTS/'latest.tmp'
     tmp.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+    if LAST is not None:
+        save_target(LAST_PROXY,report,LAST)
     os.replace(tmp,REPORTS/'latest.json')
 
 def run_scan(target, timeout, repeat, chosen=None):
@@ -155,7 +160,7 @@ def run_scan(target, timeout, repeat, chosen=None):
         change(phase='error',error='Внутренняя ошибка проверки. Частичные результаты сохранены в памяти.',current='',finished_at=now())
 
 def start_scan(body):
-    global DNS_PREVIEW, LAST
+    global DNS_PREVIEW, ADD_PREVIEW, LAST
     link = body.get('link','')
     if not isinstance(link,str) or len(link)>8192:
         raise ValueError('Некорректная ссылка.')
@@ -191,10 +196,11 @@ def start_scan(body):
             raise ValueError('Неизвестный режим.')
         STATE.update(done=0,current='',error='',started_at=now(),finished_at='')
         DNS_PREVIEW = None
+        ADD_PREVIEW = None
     threading.Thread(target=run_scan,args=(target,timeout,repeat,chosen),daemon=True).start()
 
 def dns_operation(path,body):
-    global DNS_PREVIEW
+    global DNS_PREVIEW, ADD_PREVIEW
     with LOCK:
         if STATE['phase'] in ('dns','checking','saving','key'):
             raise ValueError('Дождитесь завершения текущей операции.')
@@ -204,6 +210,7 @@ def dns_operation(path,body):
     try:
         if path=='/api/dynadot/config':
             DNS_PREVIEW=None
+            ADD_PREVIEW=None
             return dynadot.save_config(body)
         if old!='done' or not state['host'] or not state['rows']:
             raise ValueError('Сначала завершите проверку прокси.')
@@ -214,6 +221,7 @@ def dns_operation(path,body):
             return {'token':token,'host':state['host'],'zone':c['zone'],'mode':c['mode'],
                     'records':records}
         if path=='/api/dynadot/delete':
+            ADD_PREVIEW=None
             p=DNS_PREVIEW
             DNS_PREVIEW=None
             if not p or body.get('token')!=p[0] or time.monotonic()-p[1]>300 or p[2]!=state['host']:
@@ -231,9 +239,62 @@ def dns_operation(path,body):
             result=dynadot.remove(p[3],p[4],p[5],selected)
             # Keep the original measurements, but invalidate the current preview.
             return result
+        if path=='/api/dynadot/add-preview':
+            ADD_PREVIEW=None
+            if LAST is None or LAST[:2]!=(state['host'],state['port']):
+                raise ValueError('Для проверки новых IP нужна сохранённая ссылка текущего прокси.')
+            ips=dns_add.parse_ips(body.get('ips'))
+            timeout=body.get('timeout',10)
+            if type(timeout) is not int or not 1<=timeout<=15:
+                raise ValueError('Некорректный таймаут.')
+            c,sub,g,_=dynadot.preview(state)
+            new,duplicates=dns_add.prepare(g,sub,ips)
+            rows=[]
+            api=client() if new else None
+            for index,ip in enumerate(new,1):
+                change(current=f'{ip} ({index}/{len(new)})')
+                first=safe_result(api,ip,LAST[1],LAST[2],timeout)
+                # A successful Russian data check is required; external success
+                # is displayed but not required for the intended RU audience.
+                rows.append(row_for(ip,LAST[1],first,None))
+            token=secrets.token_urlsafe(24)
+            ADD_PREVIEW=(token,time.monotonic(),state['scan_id'],LAST,c,sub,g,rows)
+            return {'token':token,'host':state['host'],'zone':c['zone'],'mode':c['mode'],
+                    'ttl':dns_add.current_ttl(g),'duplicates':duplicates,'rows':rows}
+        if path=='/api/dynadot/add':
+            p=ADD_PREVIEW
+            ADD_PREVIEW=None
+            DNS_PREVIEW=None
+            if not p or body.get('token')!=p[0] or time.monotonic()-p[1]>300 or p[2]!=state['scan_id'] or p[3]!=LAST:
+                raise ValueError('Предпросмотр устарел. Проверьте новые IPv4 повторно.')
+            if body.get('confirm')!=state['host']:
+                raise ValueError('Подтвердите точное имя поддомена.')
+            selected=body.get('ips')
+            allowed={r['ip']:r for r in p[7] if r['local_data'] is True}
+            if (not isinstance(selected,list) or not selected or any(not isinstance(x,str) or x not in allowed for x in selected)
+                    or len(set(selected))!=len(selected)):
+                raise ValueError('Можно добавлять только выбранные уникальные IPv4 с успешной проверкой RU.')
+            if dynadot.config()!={k:p[4][k] for k in ('mode','key','secret','request_id_mode')}:
+                raise ValueError('Настройки Dynadot изменились.')
+            if dynadot.select_zone(state['host'],dynadot.list_domains(p[4]))!=p[4]['zone']:
+                raise ValueError('Домен в Dynadot изменился. Повторите проверку.')
+            result=dns_add.append_records(p[4],p[5],p[6],selected)
+            # Sandbox records must never be represented as live public DNS.
+            if result['mode']=='production':
+                rows={r['ip']:r for r in state['rows']}
+                rows.update({ip:allowed[ip] for ip in selected})
+                remaining=result['remaining']
+                rows=[rows[ip] for ip in remaining if ip in rows]
+                change(rows=rows,ips=remaining,done=len(rows),total=len(remaining),
+                       source='Dynadot API (настроенные A-записи; DNS-кэш может отличаться)',finished_at=now())
+                try:
+                    save_report()
+                except (OSError,ValueError):
+                    result['warning']='DNS добавлен и подтверждён, но локальный отчёт не удалось сохранить.'
+            return result
         raise ValueError('Неизвестная операция.')
     finally:
-        change(phase=old)
+        change(phase=old,current='')
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*args):
@@ -291,7 +352,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n))
             if not isinstance(body,dict):
                 raise ValueError('Некорректный запрос.')
-            if self.path in ('/api/dynadot/config','/api/dynadot/preview','/api/dynadot/delete'):
+            if self.path in ('/api/dynadot/config','/api/dynadot/preview','/api/dynadot/delete','/api/dynadot/add-preview','/api/dynadot/add'):
                 self.out(dns_operation(self.path,body))
             elif self.path == '/api/check':
                 start_scan(body)

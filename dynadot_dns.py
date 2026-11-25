@@ -135,10 +135,12 @@ def request(c,method,payload=None,path=None):
         detail=error_message(error,c,signature)
         raise DynadotError(code,detail,method,path,request_id) from None
     except (URLError,OSError,ValueError):
-        raise ValueError('Dynadot: ошибка сети или ответа. Не повторяйте удаление вслепую; обновите DNS-список.') from None
+        raise ValueError('Dynadot: ошибка сети или ответа. Не повторяйте изменение вслепую; обновите DNS-список.') from None
     if not isinstance(raw,dict) or str(raw.get('code')) not in ('0','200'):
         raise DynadotError(raw.get('code','?') if isinstance(raw,dict) else '?',error_message(raw,c,signature),method,path,request_id)
     data=raw.get('data')
+    if method=='POST' and payload is not None and path.endswith('/records') and data is None:
+        return {}
     if not isinstance(data,dict):
         raise ValueError('Dynadot: неизвестная структура ответа.')
     return data

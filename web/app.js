@@ -96,7 +96,7 @@ async function poll(){
   polling=true;try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw Error();state=await r.json();render();}
   catch(e){message('Нет связи с локальным сервером. Проверьте окно терминала.');}finally{polling=false;}
 }
-let dns=null,dnsBusy=false,dnsFingerprint='',dnsSelection=[];
+let dns=null,dnsBusy=false,dnsFingerprint='',dnsSelection=[],addition=null,addSelection=[];
 const dnsMsg=v=>{$('dnsMessage').textContent=v;};
 function dnsButtons(){
   const lock=busy||dnsBusy||active();
@@ -106,6 +106,7 @@ function dnsButtons(){
   $('dnsSelect').disabled=lock||!dns;
   const n=document.querySelectorAll('[data-dns-ip]:checked').length;
   $('dnsDelete').disabled=lock||!dns||n===0||n>=dns.records.length;
+  addButtons(lock);
   $('dnsDelete').textContent=n?'Удалить A-записи ('+n+')':'Удалить выбранные A-записи';
 }
 function dnsRender(){
@@ -113,7 +114,8 @@ function dnsRender(){
   $('dnsState').textContent=c.configured?'Подключён · '+c.mode:'Не настроен';
   $('dnsHost').textContent=state.host||'Нет отчёта';
   const fp=JSON.stringify([state.host,state.started_at,state.finished_at,c.mode,c.configured]);
-  if(dnsFingerprint!==fp){dnsFingerprint=fp;dns=null;$('dnsPreview').hidden=true;}
+  if(dnsFingerprint!==fp){dnsFingerprint=fp;dns=null;$('dnsPreview').hidden=true;clearAddition();}
+  $('addHost').textContent=state.host||'Нет отчёта';
   if(c.configured&&!$('dnsSettings').open){$('dnsMode').value=c.mode;}
 }
 async function dnsCall(fn){
@@ -124,17 +126,18 @@ async function dnsCall(fn){
 $('dnsConfig').addEventListener('submit',e=>{
   e.preventDefault();dnsCall(async()=>{
     const result=await post('/api/dynadot/config',{mode:$('dnsMode').value,key:$('dnsKey').value,secret:$('dnsSecret').value});
-    $('dnsKey').value='';$('dnsSecret').value='';$('dnsSettings').open=false;dns=null;$('dnsPreview').hidden=true;
+    $('dnsKey').value='';$('dnsSecret').value='';$('dnsSettings').open=false;clearAddition();dns=null;$('dnsPreview').hidden=true;
     dnsMsg('Подключение проверено. Активных доменов: '+result.domain_count+'. Настройки сохранены локально.');
   });
 });
-$('dnsLoad').onclick=()=>dnsCall(async()=>{
+async function loadDns(){
   dns=null;$('dnsPreview').hidden=true;
   dns=await post('/api/dynadot/preview',{});
   $('dnsRows').innerHTML=dns.records.map(r=>'<tr><td><input type="checkbox" data-dns-ip="'+esc(r.ip)+'" '+(!r.eligible?'disabled':'')+' aria-label="Выбрать '+esc(r.ip)+'"></td><td>'+esc(r.ip)+'</td><td class="'+color(r.ru)+'">'+esc(fmt(r.ru))+'</td><td class="'+color(r.ext)+'">'+esc(fmt(r.ext))+'</td><td>'+esc(r.status)+'</td></tr>').join('');
   $('dnsPreview').hidden=false;
   dnsMsg(dns.records.length?'Найдено записей: '+dns.records.length+' · '+dns.host+' (зона '+dns.zone+')':'У этого поддомена нет точных A-записей в Dynadot.');
-});
+}
+$('dnsLoad').onclick=()=>dnsCall(loadDns);
 $('dnsRows').addEventListener('change',dnsButtons);
 $('dnsSelect').onclick=()=>{
   const boxes=[...document.querySelectorAll('[data-dns-ip]:not(:disabled)')];
@@ -154,10 +157,60 @@ $('dnsApply').onclick=()=>{
   if(!dns||$('dnsConfirmHost').value!==dns.host)return;
   const payload={token:dns.token,ips:dnsSelection,confirm:$('dnsConfirmHost').value};
   $('dnsConfirm').close();
+  clearAddition();
   dnsCall(async()=>{
     dns=null;$('dnsPreview').hidden=true;
     const result=await post('/api/dynadot/delete',payload);
     dnsMsg('Удалено и проверено через Dynadot: '+result.removed.join(', ')+'. Осталось: '+result.remaining.length+'. Резервная копия: '+result.backup+'. Запустите новую проверку после обновления DNS.');
+  });
+};
+function clearAddition(){addition=null;$('addPreview').hidden=true;}
+const addMsg=v=>{$('addMessage').textContent=v;};
+function addButtons(lock=busy||dnsBusy||active()){
+  const ready=!!state.dynadot?.configured&&state.phase==='done'&&state.can_repeat&&state.has_key;
+  $('addCheck').disabled=lock||!ready||!$('addIps').value.trim();
+  $('addIps').disabled=lock;
+  const n=document.querySelectorAll('[data-add-ip]:checked').length;
+  $('addCommit').disabled=lock||!ready||!addition||!n;
+  $('addCommit').textContent=n?'Добавить A-записи ('+n+')':'Добавить выбранные A-записи';
+}
+$('addIps').addEventListener('input',()=>{clearAddition();addButtons();});
+$('addRows').addEventListener('change',()=>addButtons());
+$('addCheck').onclick=()=>{
+  clearAddition();addMsg('Проверка через MTProto API. DNS пока не изменяется…');
+  dnsCall(async()=>{
+    try{
+      addition=await post('/api/dynadot/add-preview',{ips:$('addIps').value,timeout:Number($('timeout').value)});
+      $('addRows').innerHTML=addition.rows.map(r=>'<tr><td><input type="checkbox" data-add-ip="'+esc(r.ip)+'" '+(r.local_data===true?'checked':'disabled')+' aria-label="Выбрать '+esc(r.ip)+'"></td><td>'+esc(r.ip)+'</td><td>'+metrics(r,'local')+'</td><td>'+metrics(r,'remote')+'</td><td>'+esc(r.api_status)+'</td></tr>').join('');
+      $('addPreview').hidden=!addition.rows.length;
+      const n=addition.rows.filter(r=>r.local_data===true).length;
+      addMsg('Готово к добавлению: '+n+' / '+addition.rows.length+' · TTL '+addition.ttl+' сек. '+(addition.duplicates.length?'Уже в DNS: '+addition.duplicates.join(', '):''));
+    }catch(e){clearAddition();addMsg(e.message);}
+  });
+};
+$('addCommit').onclick=()=>{
+  if(!addition)return;
+  addSelection=[...document.querySelectorAll('[data-add-ip]:checked')].map(b=>b.dataset.addIp);
+  $('addConfirmText').textContent='Добавить '+addSelection.length+' A-записей к '+addition.host+' ('+addition.mode+')? TTL: '+addition.ttl+' сек.';
+  $('addConfirmIPs').textContent=addSelection.join('\n');
+  $('addConfirmHost').value='';$('addApply').disabled=true;$('addConfirm').showModal();
+};
+$('addConfirmHost').oninput=()=>{$('addApply').disabled=!addition||$('addConfirmHost').value!==addition.host;};
+$('addCancel').onclick=()=>$('addConfirm').close();
+$('addApply').onclick=()=>{
+  if(!addition||$('addConfirmHost').value!==addition.host)return;
+  const payload={token:addition.token,ips:addSelection,confirm:$('addConfirmHost').value};
+  $('addConfirm').close();clearAddition();
+  dnsCall(async()=>{
+    dns=null;$('dnsPreview').hidden=true;
+    addMsg('Добавление и сверка DNS…');
+    try{
+      const r=await post('/api/dynadot/add',payload);
+      $('addIps').value='';
+      addMsg('Добавлено и подтверждено: '+r.added.join(', ')+'. Всего A-записей: '+r.remaining.length+'. Резервная копия: '+r.backup+'. '+(r.warning||'DNS-кэш обновится с учётом TTL.'));
+      await poll();
+      try{await loadDns();}catch(e){dnsMsg('Записи добавлены, но обновление таблицы не удалось: '+e.message);}
+    }catch(e){addMsg(e.message);}
   });
 };
 poll();setInterval(poll,1000);
