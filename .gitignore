@@ -13,3 +13,6 @@ last_proxy.json.*.tmp
 
 protected_ipv4.json
 protected_ipv4.json.*.tmp
+
+paused_ipv4.json
+paused_ipv4.json.*.tmp

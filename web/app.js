@@ -1,6 +1,8 @@
 'use strict';
 const $=id=>document.getElementById(id), token=document.querySelector('meta[name=local-token]').content;
-let state={rows:[],ips:[]}, busy=false, lastRender='', lastKey=null;
+let state={rows:[],ips:[]}, busy=false, lastRender='', lastKey=null, pauseBusy=false;
+const isPaused=ip=>(state.paused||[]).includes(ip);
+const pauseLocked=()=>pauseBusy||!!state.pause_error||!!state.pause_committing||['key','saving'].includes(state.phase);
 const esc=v=>String(v??'—').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
 const color=v=>v===true?'ok':v===false?'bad':'neutral';
 const label=v=>v===true?'Доступен':v===false?'Нет данных DC':'Не определено';
@@ -32,10 +34,11 @@ function buttons(){
   $('start').disabled=lock||!state.has_key;
   $('autoCleanup').disabled=lock||!state.dynadot?.configured||state.dynadot.mode!=='production';
   if(!state.dynadot?.configured||state.dynadot.mode!=='production')$('autoCleanup').checked=false;
-  $('failed').disabled=lock||!state.has_key||!state.can_repeat||!state.rows.some(r=>r.local_data!==true);
+  $('failed').disabled=lock||!state.has_key||!state.can_repeat||!state.rows.some(r=>r.local_data!==true&&!isPaused(r.ip));
   $('keyForm').querySelector('button').disabled=lock;
-  document.querySelectorAll('[data-repeat]').forEach(b=>b.disabled=lock||!state.has_key||!state.can_repeat);
-  $('copyCandidates').disabled=!state.rows.some(r=>r.action==='REVIEW_DNS');
+  document.querySelectorAll('[data-repeat]').forEach(b=>b.disabled=lock||!state.has_key||!state.can_repeat||isPaused(b.dataset.repeat));
+  document.querySelectorAll('[data-pause-ip]').forEach(b=>b.disabled=pauseLocked());
+  $('copyCandidates').disabled=!state.rows.some(r=>r.action==='REVIEW_DNS'&&!isPaused(r.ip));
 }
 $('scanForm').addEventListener('submit',e=>{e.preventDefault();run();});
 $('failed').onclick=()=>run('failed');
@@ -46,16 +49,40 @@ $('keyForm').addEventListener('submit',async e=>{
   try{await post('/api/key',{key:$('key').value.trim()});$('key').value='';$('keyPanel').hidden=true;message('Ключ проверен и сохранён.');await poll();}
   catch(e){message(e.message);}finally{busy=false;buttons();}
 });
-$('copyCandidates').onclick=async()=>{try{await navigator.clipboard.writeText(state.rows.filter(r=>r.action==='REVIEW_DNS').map(r=>r.ip).join('\n'));message('IP скопированы.');}catch(e){message('Не удалось скопировать. Выделите IP в блоке выше.');}};
+$('copyCandidates').onclick=async()=>{try{await navigator.clipboard.writeText(state.rows.filter(r=>r.action==='REVIEW_DNS'&&!isPaused(r.ip)).map(r=>r.ip).join('\n'));message('IP скопированы.');}catch(e){message('Не удалось скопировать. Выделите IP в блоке выше.');}};
 for(const id of ['search','filter','sort'])$(id).addEventListener('input',renderTable);
 $('closeDetail').onclick=()=>$('detail').close();
 function metrics(r,side){return '<span class="'+color(r[side+'_data'])+'">'+esc(label(r[side+'_data']))+'</span><small>Handshake '+esc(fmt(r[side+'_handshake']))+' · '+esc(r[side+'_latency_ms']??'—')+' ms</small>';}
 function renderTable(){
-  let rows=state.rows.filter(r=>r.ip.includes($('search').value.trim()));
-  const f=$('filter').value;if(f!=='all')rows=rows.filter(r=>f==='ok'?r.local_data===true:f==='bad'?r.local_data===false:r.local_data==null);
+  const existing=new Map(state.rows.map(r=>[r.ip,r]));
+  let rows=state.ips.map(ip=>existing.get(ip)||{ip,port:state.port,api_status:'WAITING',action:'RECHECK'});
+  rows=rows.filter(r=>r.ip.includes($('search').value.trim()));
+  const f=$('filter').value;
+  if(f!=='all')rows=rows.filter(r=>f==='paused'?isPaused(r.ip):!isPaused(r.ip)&&(f==='ok'?r.local_data===true:f==='bad'?r.local_data===false:r.local_data==null));
   if($('sort').value==='latency')rows.sort((a,b)=>(a.local_latency_ms??Infinity)-(b.local_latency_ms??Infinity));
-  $('rows').innerHTML=rows.map(r=>'<tr><td>'+esc(r.ip)+'<small>:'+esc(r.port)+'</small></td><td>'+metrics(r,'local')+'</td><td>'+metrics(r,'remote')+'</td><td>'+esc(r.api_status)+'<small>'+esc(r.recheck?'Повтор: '+r.recheck:r.api_status==='NOT_TESTED'?'Ожидает проверки':'Первичная проверка')+'</small></td><td class="'+tone(r)+'">'+esc(action[r.action]||r.action)+'</td><td><button class="secondary" data-detail="'+esc(r.ip)+'">Детали</button> <button class="secondary" data-repeat="'+esc(r.ip)+'">Повтор</button></td></tr>').join('');
+  $('rows').innerHTML=rows.map(r=>{
+    const paused=isPaused(r.ip), pending=!existing.has(r.ip)||['WAITING','PAUSED','NOT_TESTED'].includes(r.api_status);
+    const status=paused?'На паузе':pending?'Ожидает проверки':r.api_status;
+    return '<tr><td>'+esc(r.ip)+'<small>:'+esc(r.port)+'</small></td><td>'+(paused?'<span class="neutral">—</span>':metrics(r,'local'))+'</td><td>'+(paused?'<span class="neutral">—</span>':metrics(r,'remote'))+'</td><td>'+esc(status)+'<small>'+esc(paused?'Проверки отключены':pending?'Нет измерений':r.recheck?'Повтор: '+r.recheck:'Первичная проверка')+'</small></td><td class="'+(paused?'paused-tone':tone(r))+'">'+esc(paused?'Сохранить в DNS':pending?'Ожидает проверки':action[r.action]||r.action)+'</td><td>'+(pending||paused?'':'<button class="secondary" data-detail="'+esc(r.ip)+'">Детали</button> ')+'<button class="secondary" data-repeat="'+esc(r.ip)+'">Повтор</button> <button class="secondary pause-action" data-pause-ip="'+esc(r.ip)+'" data-pause-value="'+String(!paused)+'">'+(paused?'Возобновить':'Пауза')+'</button></td></tr>';
+  }).join('');
   $('empty').hidden=rows.length>0;buttons();
+}
+async function togglePause(ip,enabled){
+  if(pauseLocked())return;
+  pauseBusy=true;buttons();
+  const host=state.host;
+  try{
+    const result=await post('/api/ipv4/pause',{host,ip,paused:enabled});
+    if(state.host===result.host){
+      state.paused=result.paused;
+      if(!enabled)state.rows=state.rows.map(r=>r.ip===ip?{ip:r.ip,port:r.port,api_status:'WAITING',action:'RECHECK'}:r);
+      render();
+    }
+    dns=null;$('dnsPreview').hidden=true;
+    $('pauseMessage').textContent=ip+(enabled?' — на паузе. DNS сохранён.':' — проверки возобновлены со следующего цикла.');
+    await poll();
+  }catch(e){$('pauseMessage').textContent=e.message;}
+  finally{pauseBusy=false;buttons();}
 }
 function detail(ip){
   const r=state.rows.find(x=>x.ip===ip);if(!r)return;
@@ -66,6 +93,8 @@ function detail(ip){
 }
 document.addEventListener('click',e=>{
   const d=e.target.closest('[data-detail]'),r=e.target.closest('[data-repeat]');
+  const p=e.target.closest('[data-pause-ip]');
+  if(p)togglePause(p.dataset.pauseIp,p.dataset.pauseValue==='true');
   if(d)detail(d.dataset.detail);if(r)run('one',r.dataset.repeat);
 });
 function render(){
@@ -90,16 +119,18 @@ function render(){
   if(state.error)message(state.error);
   $('domain').textContent=state.host?state.host+':'+state.port:'—';
   $('topologyRoot').textContent=state.host?state.host+':'+state.port:'Нет активного отчёта';
-  const signature=JSON.stringify([state.ips,state.rows,state.host,state.port,state.can_repeat]);
+  if(state.pause_error)$('pauseMessage').textContent=state.pause_error;
+  const signature=JSON.stringify([state.ips,state.rows,state.host,state.port,state.can_repeat,state.paused]);
   if(signature!==lastRender){
     lastRender=signature;
-    const ok=state.rows.filter(r=>r.local_data===true).length,bad=state.rows.filter(r=>r.local_data===false).length;
-    $('stats').innerHTML=[['IPv4 в DNS',state.ips.length,''],['Доступны из РФ',ok,'ok'],['Недоступны из РФ',bad,'bad'],['Нет данных / ожидают',Math.max(0,state.ips.length-ok-bad),'warn']].map(([l,n,c])=>'<div class="stat"><span>'+l+'</span><strong class="'+c+'">'+n+'</strong></div>').join('');
-    $('candidates').textContent=state.rows.filter(r=>r.action==='REVIEW_DNS').map(r=>r.ip).join(' · ')||'Нет подтверждённых повтором кандидатов.';
+    const ok=state.rows.filter(r=>r.local_data===true&&!isPaused(r.ip)).length,bad=state.rows.filter(r=>r.local_data===false&&!isPaused(r.ip)).length,pausedCount=state.ips.filter(isPaused).length;
+    $('stats').innerHTML=[['IPv4 в DNS',state.ips.length,''],['Доступны из РФ',ok,'ok'],['Недоступны из РФ',bad,'bad'],['Нет данных / ожидают',Math.max(0,state.ips.length-ok-bad-pausedCount),'warn'],['На паузе',pausedCount,'paused-tone']].map(([l,n,c])=>'<div class="stat"><span>'+l+'</span><strong class="'+c+'">'+n+'</strong></div>').join('');
+    $('candidates').textContent=state.rows.filter(r=>r.action==='REVIEW_DNS'&&!isPaused(r.ip)).map(r=>r.ip).join(' · ')||'Нет подтверждённых повтором кандидатов.';
     renderTable();
     $('nodes').innerHTML=state.ips.map(ip=>{
       const r=state.rows.find(x=>x.ip===ip);
-      return '<button class="node '+(r?tone(r):'neutral')+'" '+(r?'data-detail="'+esc(ip)+'"':'disabled')+'><strong>'+esc(ip)+'</strong><div class="branches"><span class="'+color(r?.local_data)+'">RU '+esc(fmt(r?.local_data))+'</span><span class="'+color(r?.remote_data)+'">EXT '+esc(fmt(r?.remote_data))+'</span></div><div class="node-status '+(r?tone(r):'neutral')+'">'+esc(r?.api_status==='NOT_TESTED'?'Ожидает проверки':r?.status||'Ожидает проверки')+'</div><small>API: '+esc(r?.api_status||'—')+' · '+esc(r?.local_latency_ms??'—')+' ms</small></button>';
+      if(isPaused(ip))return '<button class="node paused-tone" data-pause-ip="'+esc(ip)+'" data-pause-value="false"><strong>'+esc(ip)+'</strong><div class="node-status paused-tone">На паузе</div><small>DNS сохранён · возобновить</small></button>';
+      return '<button class="node '+(r?tone(r):'neutral')+'" '+(r?'data-detail="'+esc(ip)+'"':'disabled')+'><strong>'+esc(ip)+'</strong><div class="branches"><span class="'+color(r?.local_data)+'">RU '+esc(fmt(r?.local_data))+'</span><span class="'+color(r?.remote_data)+'">EXT '+esc(fmt(r?.remote_data))+'</span></div><div class="node-status '+(r?tone(r):'neutral')+'">'+esc(['NOT_TESTED','WAITING','PAUSED'].includes(r?.api_status)?'Ожидает проверки':r?.status||'Ожидает проверки')+'</div><small>API: '+esc(r?.api_status||'—')+' · '+esc(r?.local_latency_ms??'—')+' ms</small></button>';
     }).join('');
   }
   buttons();

@@ -3,6 +3,7 @@ import argparse
 import dynadot_dns as dynadot
 import dynadot_add as dns_add
 import auto_dns
+import pause_store
 from monitor_cycle import Monitor, INTERVAL
 import copy
 import csv
@@ -35,6 +36,8 @@ LAST = None
 CLIENT = None
 DNS_PREVIEW = None
 ADD_PREVIEW = None
+PAUSE_REV = 0
+PAUSE_COMMIT = False
 FIELDS = ('tcp','handshake','data','ssh','ping_ms','latency_ms','duration_ms')
 
 def now():
@@ -94,6 +97,34 @@ def row_for(ip, port, first, second):
             row[side+'_'+key] = field(last,side,key)
     return row
 
+def paused(host):
+    # LAST_PROXY is workspace-specific, including after workspace restoration.
+    return pause_store.paused(LAST_PROXY.parent/'paused_ipv4.json',host)
+
+def pending_row(ip,port,status='WAITING'):
+    row=row_for(ip,port,{'status':status},None)
+    if status=='PAUSED':
+        row.update(status='PAUSED',action='PAUSED')
+    return row
+
+def pause_operation(body):
+    global PAUSE_REV, DNS_PREVIEW
+    with LOCK:
+        if PAUSE_COMMIT or STATE['phase'] in ('key','saving'):
+            raise ValueError('DNS-операция или сохранение уже начались. Повторите после завершения.')
+        host=STATE['host']
+        ip=body.get('ip')
+        enable=body.get('paused')
+        if not host or body.get('host')!=host or not isinstance(ip,str) or ip not in STATE['ips'] or type(enable) is not bool:
+            raise ValueError('Адрес не относится к текущему пулу IPv4.')
+        result=pause_store.update(LAST_PROXY.parent/'paused_ipv4.json',host,ip,enable,dynadot.private_write)
+        PAUSE_REV+=1
+        DNS_PREVIEW=None
+        if not enable:
+            # Do not display measurements from before the pause as fresh.
+            STATE['rows']=[pending_row(ip,STATE['port']) if r['ip']==ip and r.get('api_status')!='NOT_TESTED' else r for r in STATE['rows']]
+        return {'host':host,'paused':sorted(result)}
+
 def csv_bytes(rows):
     f = io.StringIO(newline='')
     if rows:
@@ -120,7 +151,8 @@ def save_report():
         save_target(LAST_PROXY,report,LAST)
     os.replace(tmp,REPORTS/'latest.json')
 
-def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected,generation=None,target=None):
+def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected,generation=None,target=None,pause_rev=None):
+    global PAUSE_COMMIT
     selected,reason=auto_dns.plan(ips,rows,protected)
     result={'status':'skipped','message':reason,'removed':[],'protected':sorted(protected & set(ips))}
     if not selected:
@@ -133,22 +165,27 @@ def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected,generation=None,target
             raise ValueError('DNS-зона изменилась.')
         result.update(status='checking',message='Удаление подтверждённых недоступных IPv4…')
         change(auto_result=dict(result))
-        if generation is not None:
-            with LOCK:
-                if not MONITOR.matches(generation,target):
-                    return dict(result,status='skipped',message='Мониторинг остановлен до удаления.')
+        with LOCK:
+            if generation is not None and not MONITOR.matches(generation,target):
+                return dict(result,status='skipped',message='Мониторинг остановлен до удаления.')
+            if (pause_rev is not None and PAUSE_REV!=pause_rev) or set(selected)&paused(host):
+                return dict(result,status='skipped',message='Пауза IPv4 изменилась. Автоудаление отложено до следующей проверки.')
+            # Atomically guard the final pause check and start of the mutation.
+            PAUSE_COMMIT=True
+            if generation is not None:
                 MONITOR.committing=True
         try:
             deleted=dynadot.remove(c,sub,zone,selected)
         finally:
-            if generation is not None:
-                with LOCK:
+            with LOCK:
+                PAUSE_COMMIT=False
+                if generation is not None:
                     MONITOR.committing=False
         result.update(status='removed',message='Удаление подтверждено Dynadot.',
                       removed=deleted['removed'],backup=deleted['backup'],
                       measurements=[r for r in rows if r['ip'] in selected])
         remaining=deleted['remaining']
-        change(rows=[r for r in rows if r['ip'] in remaining],ips=remaining,
+        change(rows=[r for r in snapshot()['rows'] if r['ip'] in remaining],ips=remaining,
                done=len(remaining),total=len(remaining),
                source='Dynadot API (после автоудаления; DNS-кэш может отличаться)')
     except Exception as e:
@@ -163,6 +200,9 @@ def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected,generation=None,target
 def run_scan(target, timeout, repeat, chosen=None, auto=False, generation=None):
     host,port,secret = target
     try:
+        with LOCK:
+            pause_rev=PAUSE_REV
+            paused(host)  # fail closed on unreadable settings
         api = client()
         if auto:
             c=dynadot.config()
@@ -187,27 +227,44 @@ def run_scan(target, timeout, repeat, chosen=None, auto=False, generation=None):
                     if not MONITOR.matches(generation,target):
                         STATE.update(phase='error',error='Мониторинг остановлен. Проверка прервана без автоудаления.',current='',finished_at=now())
                         return
-            change(current=ip)
-            first = safe_result(api,ip,port,secret,timeout)
-            second = None
-            if (repeat or auto) and field(first,'local','data') is not True:
-                change(current=ip+' · повтор')
-                if auto:
-                    time.sleep(5)
-                second = safe_result(api,ip,port,secret,timeout)
-            row = row_for(ip,port,first,second)
             with LOCK:
+                excluded=ip in paused(host)
+                STATE['current']=ip+(' · пауза' if excluded else '')
+            if excluded:
+                row=pending_row(ip,port,'PAUSED')
+            else:
+                first = safe_result(api,ip,port,secret,timeout)
+                second = None
+                if (repeat or auto) and field(first,'local','data') is not True:
+                    change(current=ip+' · повтор')
+                    if auto:
+                        time.sleep(5)
+                    with LOCK:
+                        skip_repeat=ip in paused(host) or (generation is not None and not MONITOR.matches(generation,target))
+                    if not skip_repeat:
+                        second = safe_result(api,ip,port,secret,timeout)
+                row = row_for(ip,port,first,second)
+            with LOCK:
+                if ip in paused(host):
+                    row=pending_row(ip,port,'PAUSED')
                 STATE['rows'] = [r for r in STATE['rows'] if r['ip'] != ip] + [row]
                 order = {v:j for j,v in enumerate(STATE['ips'])}
                 STATE['rows'].sort(key=lambda r:order.get(r['ip'],0))
                 STATE['done'] = i
         try:
-            rows=snapshot()['rows']
-            # Only measurements made in this run may release provisioning protection.
-            protected=auto_dns.release_healthy(PROTECTED,host,[r for r in rows if r['ip'] in ips],dynadot.private_write)
+            with LOCK:
+                excluded=paused(host)
+                rows=copy.deepcopy(STATE['rows'])
+                active_ips,active_rows=pause_store.active_pool(ips,rows,excluded)
+            # Only measurements of non-paused addresses made in this run may release protection.
+            protected=auto_dns.release_healthy(PROTECTED,host,active_rows,dynadot.private_write)
             if auto:
                 change(current='Проверка условий автоудаления')
-                change(auto_result=apply_auto_cleanup(c,sub,zone,host,ips,rows,protected,generation,target))
+                if not active_ips:
+                    result={'status':'skipped','message':'Все IPv4 на паузе.','removed':[]}
+                else:
+                    result=apply_auto_cleanup(c,sub,zone,host,active_ips,active_rows,protected,generation,target,pause_rev)
+                change(auto_result=result)
         except (ValueError,OSError) as exc:
             if auto:
                 change(auto_result={'status':'skipped','message':str(exc),'removed':[]})
@@ -280,8 +337,11 @@ def start_scan(body,generation=None):
         elif mode in ('one','failed'):
             if LAST is None or target != LAST or (target[0],target[1]) != (STATE['host'],STATE['port']):
                 raise ValueError('Для повтора используйте последний проверенный прокси.')
+            excluded=paused(target[0])
             chosen = ([body.get('ip')] if mode == 'one' else
-                      [r['ip'] for r in STATE['rows'] if r['local_data'] is not True])
+                      [r['ip'] for r in STATE['rows'] if r['local_data'] is not True and r['ip'] not in excluded])
+            if mode=='one' and chosen[0] in excluded:
+                raise ValueError('Сначала возобновите проверку этого IPv4.')
             if not chosen or any(ip not in STATE['ips'] for ip in chosen):
                 raise ValueError('Нет подходящих IP для повтора.')
             STATE.update(phase='checking',total=len(chosen))
@@ -351,6 +411,10 @@ def dns_operation(path,body):
             raise ValueError('Сначала завершите проверку прокси.')
         if path=='/api/dynadot/preview':
             c,sub,g,records=dynadot.preview(state)
+            excluded=paused(state['host'])
+            for record in records:
+                if record['ip'] in excluded:
+                    record.update(eligible=False,status='PAUSED',ru=None,ext=None)
             token=secrets.token_urlsafe(24)
             DNS_PREVIEW=(token,time.monotonic(),state['host'],c,sub,g,records)
             return {'token':token,'host':state['host'],'zone':c['zone'],'mode':c['mode'],
@@ -364,7 +428,7 @@ def dns_operation(path,body):
             if body.get('confirm')!=state['host']:
                 raise ValueError('Подтвердите точное имя поддомена.')
             selected=body.get('ips')
-            allowed={r['ip'] for r in p[6] if r['eligible']}
+            allowed={r['ip'] for r in p[6] if r['eligible'] and r['ip'] not in paused(state['host'])}
             if not isinstance(selected,list) or not selected or any(not isinstance(x,str) or x not in allowed for x in selected):
                 raise ValueError('Можно удалить только выбранные проверенные IP с RU data=false.')
             if dynadot.config()!={k:p[3][k] for k in ('mode','key','secret','request_id_mode')}:
@@ -459,6 +523,12 @@ class Handler(BaseHTTPRequestHandler):
             data['dynadot'] = dynadot.public_config()
             with LOCK:
                 data['monitor'] = MONITOR.public(time.monotonic())
+                data['pause_committing'] = PAUSE_COMMIT
+                try:
+                    data['paused'] = sorted(paused(STATE['host'])) if STATE['host'] else []
+                except ValueError as exc:
+                    data['paused'] = []
+                    data['pause_error'] = str(exc)
                 data['can_repeat'] = LAST is not None and (LAST[0],LAST[1]) == (STATE['host'],STATE['port'])
             self.out(data)
         elif self.path == '/export.json':
@@ -483,6 +553,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.out(dns_operation(self.path,body))
             elif self.path in ('/api/monitor/start','/api/monitor/stop'):
                 self.out(monitor_operation(self.path,body))
+            elif self.path == '/api/ipv4/pause':
+                self.out(pause_operation(body))
             elif self.path == '/api/check':
                 start_scan(body)
                 self.out({'ok':True},202)
