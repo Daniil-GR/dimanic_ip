@@ -47,7 +47,7 @@ function renderTable(){
   let rows=state.rows.filter(r=>r.ip.includes($('search').value.trim()));
   const f=$('filter').value;if(f!=='all')rows=rows.filter(r=>f==='ok'?r.local_data===true:f==='bad'?r.local_data===false:r.local_data==null);
   if($('sort').value==='latency')rows.sort((a,b)=>(a.local_latency_ms??Infinity)-(b.local_latency_ms??Infinity));
-  $('rows').innerHTML=rows.map(r=>'<tr><td>'+esc(r.ip)+'<small>:'+esc(r.port)+'</small></td><td>'+metrics(r,'local')+'</td><td>'+metrics(r,'remote')+'</td><td>'+esc(r.api_status)+'<small>'+esc(r.recheck?'Повтор: '+r.recheck:'Первичная проверка')+'</small></td><td class="'+tone(r)+'">'+esc(action[r.action]||r.action)+'</td><td><button class="secondary" data-detail="'+esc(r.ip)+'">Детали</button> <button class="secondary" data-repeat="'+esc(r.ip)+'">Повтор</button></td></tr>').join('');
+  $('rows').innerHTML=rows.map(r=>'<tr><td>'+esc(r.ip)+'<small>:'+esc(r.port)+'</small></td><td>'+metrics(r,'local')+'</td><td>'+metrics(r,'remote')+'</td><td>'+esc(r.api_status)+'<small>'+esc(r.recheck?'Повтор: '+r.recheck:r.api_status==='NOT_TESTED'?'Ожидает проверки':'Первичная проверка')+'</small></td><td class="'+tone(r)+'">'+esc(action[r.action]||r.action)+'</td><td><button class="secondary" data-detail="'+esc(r.ip)+'">Детали</button> <button class="secondary" data-repeat="'+esc(r.ip)+'">Повтор</button></td></tr>').join('');
   $('empty').hidden=rows.length>0;buttons();
 }
 function detail(ip){
@@ -85,7 +85,7 @@ function render(){
     renderTable();
     $('nodes').innerHTML=state.ips.map(ip=>{
       const r=state.rows.find(x=>x.ip===ip);
-      return '<button class="node '+(r?tone(r):'neutral')+'" '+(r?'data-detail="'+esc(ip)+'"':'disabled')+'><strong>'+esc(ip)+'</strong><div class="branches"><span class="'+color(r?.local_data)+'">RU '+esc(fmt(r?.local_data))+'</span><span class="'+color(r?.remote_data)+'">EXT '+esc(fmt(r?.remote_data))+'</span></div><div class="node-status '+(r?tone(r):'neutral')+'">'+esc(r?.status||'Ожидает проверки')+'</div><small>API: '+esc(r?.api_status||'—')+' · '+esc(r?.local_latency_ms??'—')+' ms</small></button>';
+      return '<button class="node '+(r?tone(r):'neutral')+'" '+(r?'data-detail="'+esc(ip)+'"':'disabled')+'><strong>'+esc(ip)+'</strong><div class="branches"><span class="'+color(r?.local_data)+'">RU '+esc(fmt(r?.local_data))+'</span><span class="'+color(r?.remote_data)+'">EXT '+esc(fmt(r?.remote_data))+'</span></div><div class="node-status '+(r?tone(r):'neutral')+'">'+esc(r?.api_status==='NOT_TESTED'?'Ожидает проверки':r?.status||'Ожидает проверки')+'</div><small>API: '+esc(r?.api_status||'—')+' · '+esc(r?.local_latency_ms??'—')+' ms</small></button>';
     }).join('');
   }
   buttons();
@@ -167,7 +167,7 @@ $('dnsApply').onclick=()=>{
 function clearAddition(){addition=null;$('addPreview').hidden=true;}
 const addMsg=v=>{$('addMessage').textContent=v;};
 function addButtons(lock=busy||dnsBusy||active()){
-  const ready=!!state.dynadot?.configured&&state.phase==='done'&&state.can_repeat&&state.has_key;
+  const ready=!!state.dynadot?.configured&&state.phase==='done'&&!!state.host;
   $('addCheck').disabled=lock||!ready||!$('addIps').value.trim();
   $('addIps').disabled=lock;
   const n=document.querySelectorAll('[data-add-ip]:checked').length;
@@ -177,14 +177,13 @@ function addButtons(lock=busy||dnsBusy||active()){
 $('addIps').addEventListener('input',()=>{clearAddition();addButtons();});
 $('addRows').addEventListener('change',()=>addButtons());
 $('addCheck').onclick=()=>{
-  clearAddition();addMsg('Проверка через MTProto API. DNS пока не изменяется…');
+  clearAddition();addMsg('Проверка формата IPv4 и существующих DNS-записей…');
   dnsCall(async()=>{
     try{
-      addition=await post('/api/dynadot/add-preview',{ips:$('addIps').value,timeout:Number($('timeout').value)});
-      $('addRows').innerHTML=addition.rows.map(r=>'<tr><td><input type="checkbox" data-add-ip="'+esc(r.ip)+'" '+(r.local_data===true?'checked':'disabled')+' aria-label="Выбрать '+esc(r.ip)+'"></td><td>'+esc(r.ip)+'</td><td>'+metrics(r,'local')+'</td><td>'+metrics(r,'remote')+'</td><td>'+esc(r.api_status)+'</td></tr>').join('');
-      $('addPreview').hidden=!addition.rows.length;
-      const n=addition.rows.filter(r=>r.local_data===true).length;
-      addMsg('Готово к добавлению: '+n+' / '+addition.rows.length+' · TTL '+addition.ttl+' сек. '+(addition.duplicates.length?'Уже в DNS: '+addition.duplicates.join(', '):''));
+      addition=await post('/api/dynadot/add-preview',{ips:$('addIps').value});
+      $('addRows').innerHTML=addition.ips.map(ip=>'<tr><td><input type="checkbox" data-add-ip="'+esc(ip)+'" checked aria-label="Выбрать '+esc(ip)+'"></td><td>'+esc(ip)+'</td><td class="neutral">Новая A-запись · MTProto не проверен</td></tr>').join('');
+      $('addPreview').hidden=!addition.ips.length;
+      addMsg('Готово к добавлению: '+addition.ips.length+' · TTL '+addition.ttl+' сек. '+(addition.duplicates.length?'Уже в DNS: '+addition.duplicates.join(', '):''));
     }catch(e){clearAddition();addMsg(e.message);}
   });
 };
@@ -207,7 +206,7 @@ $('addApply').onclick=()=>{
     try{
       const r=await post('/api/dynadot/add',payload);
       $('addIps').value='';
-      addMsg('Добавлено и подтверждено: '+r.added.join(', ')+'. Всего A-записей: '+r.remaining.length+'. Резервная копия: '+r.backup+'. '+(r.warning||'DNS-кэш обновится с учётом TTL.'));
+      addMsg('Добавлено и подтверждено: '+r.added.join(', ')+'. Всего A-записей: '+r.remaining.length+'. Резервная копия: '+r.backup+'. '+(r.warning||'Теперь настройте прокси на VPS и запустите проверку. DNS-кэш обновится с учётом TTL.'));
       await poll();
       try{await loadDns();}catch(e){dnsMsg('Записи добавлены, но обновление таблицы не удалось: '+e.message);}
     }catch(e){addMsg(e.message);}

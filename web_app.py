@@ -241,39 +241,27 @@ def dns_operation(path,body):
             return result
         if path=='/api/dynadot/add-preview':
             ADD_PREVIEW=None
-            if LAST is None or LAST[:2]!=(state['host'],state['port']):
-                raise ValueError('Для проверки новых IP нужна сохранённая ссылка текущего прокси.')
             ips=dns_add.parse_ips(body.get('ips'))
-            timeout=body.get('timeout',10)
-            if type(timeout) is not int or not 1<=timeout<=15:
-                raise ValueError('Некорректный таймаут.')
             c,sub,g,_=dynadot.preview(state)
             new,duplicates=dns_add.prepare(g,sub,ips)
-            rows=[]
-            api=client() if new else None
-            for index,ip in enumerate(new,1):
-                change(current=f'{ip} ({index}/{len(new)})')
-                first=safe_result(api,ip,LAST[1],LAST[2],timeout)
-                # A successful Russian data check is required; external success
-                # is displayed but not required for the intended RU audience.
-                rows.append(row_for(ip,LAST[1],first,None))
+            # DNS provisioning precedes proxy installation. No MTProto API call.
             token=secrets.token_urlsafe(24)
-            ADD_PREVIEW=(token,time.monotonic(),state['scan_id'],LAST,c,sub,g,rows)
+            ADD_PREVIEW=(token,time.monotonic(),state['scan_id'],(state['host'],state['port']),c,sub,g,new)
             return {'token':token,'host':state['host'],'zone':c['zone'],'mode':c['mode'],
-                    'ttl':dns_add.current_ttl(g),'duplicates':duplicates,'rows':rows}
+                    'ttl':dns_add.current_ttl(g),'duplicates':duplicates,'ips':new}
         if path=='/api/dynadot/add':
             p=ADD_PREVIEW
             ADD_PREVIEW=None
             DNS_PREVIEW=None
-            if not p or body.get('token')!=p[0] or time.monotonic()-p[1]>300 or p[2]!=state['scan_id'] or p[3]!=LAST:
-                raise ValueError('Предпросмотр устарел. Проверьте новые IPv4 повторно.')
+            if not p or body.get('token')!=p[0] or time.monotonic()-p[1]>300 or p[2]!=state['scan_id'] or p[3]!=(state['host'],state['port']):
+                raise ValueError('Предпросмотр устарел. Подготовьте добавление заново.')
             if body.get('confirm')!=state['host']:
                 raise ValueError('Подтвердите точное имя поддомена.')
             selected=body.get('ips')
-            allowed={r['ip']:r for r in p[7] if r['local_data'] is True}
+            allowed=set(p[7])
             if (not isinstance(selected,list) or not selected or any(not isinstance(x,str) or x not in allowed for x in selected)
                     or len(set(selected))!=len(selected)):
-                raise ValueError('Можно добавлять только выбранные уникальные IPv4 с успешной проверкой RU.')
+                raise ValueError('Можно добавлять только выбранные уникальные IPv4 из предпросмотра.')
             if dynadot.config()!={k:p[4][k] for k in ('mode','key','secret','request_id_mode')}:
                 raise ValueError('Настройки Dynadot изменились.')
             if dynadot.select_zone(state['host'],dynadot.list_domains(p[4]))!=p[4]['zone']:
@@ -282,10 +270,10 @@ def dns_operation(path,body):
             # Sandbox records must never be represented as live public DNS.
             if result['mode']=='production':
                 rows={r['ip']:r for r in state['rows']}
-                rows.update({ip:allowed[ip] for ip in selected})
+                rows.update({ip:row_for(ip,state['port'],{'status':'NOT_TESTED'},None) for ip in selected})
                 remaining=result['remaining']
                 rows=[rows[ip] for ip in remaining if ip in rows]
-                change(rows=rows,ips=remaining,done=len(rows),total=len(remaining),
+                change(rows=rows,ips=remaining,done=sum(r['api_status']!='NOT_TESTED' for r in rows),total=len(remaining),
                        source='Dynadot API (настроенные A-записи; DNS-кэш может отличаться)',finished_at=now())
                 try:
                     save_report()
