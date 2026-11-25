@@ -21,15 +21,19 @@ class Monitor:
         self.committing = False
         self.interval = INTERVAL
         self.auto_cleanup = False
+        self.allow_empty = False
 
-    def start(self, target, timeout, now, interval=None, auto_cleanup=False):
+    def start(self, target, timeout, now, interval=None, auto_cleanup=False, allow_empty=False):
         if self.enabled or self.committing:
             raise ValueError('Мониторинг уже запущен или завершается удаление.')
         interval = validate_interval(self.interval if interval is None else interval)
         if type(auto_cleanup) is not bool:
             raise ValueError('Некорректный режим автоудаления.')
+        if type(allow_empty) is not bool or (allow_empty and not auto_cleanup):
+            raise ValueError('Полная очистка требует автоудаления.')
         self.interval = interval
         self.auto_cleanup = auto_cleanup
+        self.allow_empty = allow_empty
         self.generation += 1
         self.enabled = True
         self.target = target
@@ -49,6 +53,7 @@ class Monitor:
         self.generation += 1
         self.next_due = None
         self.auto_cleanup = False
+        self.allow_empty = False
         self.message = message
 
     def due(self, now, busy):
@@ -63,6 +68,6 @@ class Monitor:
 
     def public(self, now):
         return {'enabled': self.enabled, 'host': self.target[0] if self.target else '',
-                'port': self.target[1] if self.target else None, 'interval': self.interval, 'auto_cleanup': self.auto_cleanup,
+                'port': self.target[1] if self.target else None, 'interval': self.interval, 'auto_cleanup': self.auto_cleanup, 'allow_empty': self.allow_empty,
                 'seconds': max(0, math.ceil(self.next_due-now)) if self.enabled and self.next_due is not None else None,
                 'message': self.message, 'committing': self.committing}

@@ -50,18 +50,19 @@ def release_protection(path, host, ip, write):
     return current
 
 
-def plan(ips, rows, protected):
+def plan(ips, rows, protected, allow_empty=False):
     expected = set(ips)
     indexed = {r['ip']: r for r in rows}
     if not expected or set(indexed) != expected or len(indexed) != len(rows):
         return [], 'Неполная проверка пула.'
-    if not any(r.get('local_data') is True for r in rows):
+    if not allow_empty and not any(r.get('local_data') is True for r in rows):
         return [], 'Нет ни одного доступного из РФ IP; возможен общий сбой.'
     if any(r.get('local_data') is None or r.get('first_ru_data') is None for r in rows):
         return [], 'Есть неопределённые результаты API; автоудаление отменено.'
     selected = [ip for ip in ips if ip not in protected and
                 indexed[ip].get('first_ru_data') is False and
                 indexed[ip].get('local_data') is False and
+                indexed[ip].get('first_api_status',indexed[ip].get('recheck')) in ('RKN_BLOCK','DATA_CUT','MT_DEAD','DOWN','UNKNOWN') and
                 indexed[ip].get('recheck') in ('RKN_BLOCK','DATA_CUT','MT_DEAD','DOWN','UNKNOWN')]
     if selected:
         return selected, ''

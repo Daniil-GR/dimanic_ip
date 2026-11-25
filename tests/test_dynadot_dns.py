@@ -128,6 +128,24 @@ class DynadotZoneTests(unittest.TestCase):
         request.assert_called_once_with(cfg,'DELETE',{'dns_sub_list':[target]})
         self.assertEqual(result['remaining'],['192.0.2.11'])
 
+    @patch('dynadot_dns.private_write')
+    @patch('dynadot_dns.request')
+    @patch('dynadot_dns.get_zone')
+    def test_last_record_explicit_permission(self,get_zone,request,write):
+        target=self.zone['dns_sub_list'][0]
+        other=dict(target,sub_host='other')
+        before=dict(self.zone,dns_sub_list=[target,other])
+        after=dict(before,dns_sub_list=[other])
+        cfg=dict(C,zone='example.com')
+        with self.assertRaises(ValueError):
+            d.remove(cfg,'dev2',before,['192.0.2.10'])
+        request.assert_not_called()
+        get_zone.side_effect=[before,after]
+        request.return_value={'main_record_removed_count':0,'sub_record_removed_count':1}
+        result=d.remove(cfg,'dev2',before,['192.0.2.10'],allow_empty=True)
+        request.assert_called_once_with(cfg,'DELETE',{'dns_sub_list':[target]})
+        self.assertEqual(result['remaining'],[])
+
     def test_external_dns_rejected(self):
         with self.assertRaisesRegex(ValueError,'name_servers'):
             d.parse_zone({'glue_info':dict(self.zone,glue_type='name_servers')},'example.com')

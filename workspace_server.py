@@ -117,12 +117,12 @@ def wire(module, page_id):
                 require_unique(module.LAST[0], page_id)
             return original_monitor(path, body)
 
-    def cleanup(c, sub, zone, host, ips, rows, protected, generation=None, target=None, pause_rev=None):
+    def cleanup(c, sub, zone, host, ips, rows, protected, generation=None, target=None, pause_rev=None, allow_empty=False):
         # Serialize DNS mutations, including the initial fresh-read and verification.
         # Another page may have changed a different subdomain in this same zone.
         # A changed zone is a skipped cycle, not a reason to stop monitoring.
         with DNS_LOCK:
-            selected, reason = module.auto_dns.plan(ips, rows, protected)
+            selected, reason = module.auto_dns.plan(ips, rows, protected, allow_empty)
             if selected:
                 try:
                     fresh = module.dynadot.get_zone(c)
@@ -131,7 +131,7 @@ def wire(module, page_id):
                                 'removed':[],'protected':sorted(protected & set(ips))}
                 except (ValueError, OSError) as exc:
                     return {'status':'skipped','message':'Не удалось перепроверить DNS: '+str(exc),'removed':[]}
-            return original_cleanup(c,sub,zone,host,ips,rows,protected,generation,target,pause_rev)
+            return original_cleanup(c,sub,zone,host,ips,rows,protected,generation,target,pause_rev,allow_empty)
 
     module.start_scan = start_scan
     module.monitor_operation = monitor_operation

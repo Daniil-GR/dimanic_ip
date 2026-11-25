@@ -170,9 +170,9 @@ def save_report():
         save_target(LAST_PROXY,report,LAST)
     os.replace(tmp,REPORTS/'latest.json')
 
-def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected,generation=None,target=None,pause_rev=None):
+def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected,generation=None,target=None,pause_rev=None,allow_empty=False):
     global PAUSE_COMMIT
-    selected,reason=auto_dns.plan(ips,rows,protected)
+    selected,reason=auto_dns.plan(ips,rows,protected,allow_empty)
     result={'status':'skipped','message':reason,'removed':[],'protected':sorted(protected & set(ips))}
     if not selected:
         return result
@@ -194,7 +194,7 @@ def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected,generation=None,target
             if generation is not None:
                 MONITOR.committing=True
         try:
-            deleted=dynadot.remove(c,sub,zone,selected)
+            deleted=dynadot.remove(c,sub,zone,selected,allow_empty=allow_empty)
         finally:
             with LOCK:
                 PAUSE_COMMIT=False
@@ -221,7 +221,7 @@ def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected,generation=None,target
                       ' Обновите DNS-список вручную. Автоматического повтора нет.')
     return result
 
-def run_scan(target, timeout, repeat, chosen=None, auto=False, generation=None):
+def run_scan(target, timeout, repeat, chosen=None, auto=False, generation=None, allow_empty=False):
     host,port,secret = target
     try:
         with LOCK:
@@ -236,8 +236,7 @@ def run_scan(target, timeout, repeat, chosen=None, auto=False, generation=None):
             sub=dynadot.subhost(host,c)
             zone=dynadot.get_zone(c)
             ips=sorted(dynadot.matching(zone,sub))
-            if not ips:
-                raise ValueError('В Dynadot нет A-записей текущего поддомена.')
+            # An empty pool is a valid completed cycle. Continue monitoring for new records.
             change(ips=ips,source='Dynadot API (текущий пул A-записей)',total=len(ips),phase='checking')
         elif chosen is None:
             ips,source = resolve_ips(host)
@@ -292,9 +291,9 @@ def run_scan(target, timeout, repeat, chosen=None, auto=False, generation=None):
             if auto:
                 change(current='Проверка условий автоудаления')
                 if not active_ips:
-                    result={'status':'skipped','message':'Все IPv4 на паузе.','removed':[]}
+                    result={'status':'skipped','message':'Все IPv4 на паузе.' if ips else 'В Dynadot нет A-записей текущего поддомена.','removed':[]}
                 else:
-                    result=apply_auto_cleanup(c,sub,zone,host,active_ips,active_rows,protected,generation,target,pause_rev)
+                    result=apply_auto_cleanup(c,sub,zone,host,active_ips,active_rows,protected,generation,target,pause_rev,allow_empty)
                 change(auto_result=result)
         except (ValueError,OSError) as exc:
             if auto:
@@ -331,6 +330,9 @@ def start_scan(body,generation=None):
     repeat = body.get('repeat',True) is True
     mode = body.get('mode','all')
     auto = body.get('auto_cleanup') is True
+    allow_empty = body.get('allow_empty',False)
+    if type(allow_empty) is not bool or (allow_empty and not auto):
+        raise ValueError('Полная очистка требует автоудаления.')
     if auto and mode!='all':
         raise ValueError('Автоудаление разрешено только при полной проверке.')
     if auto and dynadot.config()['mode']!='production':
@@ -338,7 +340,7 @@ def start_scan(body,generation=None):
     with LOCK:
         if MONITOR.enabled and generation is None:
             raise ValueError('Остановите мониторинг перед ручной проверкой.')
-        if generation is not None and (not MONITOR.matches(generation,LAST) or auto != MONITOR.auto_cleanup):
+        if generation is not None and (not MONITOR.matches(generation,LAST) or auto != MONITOR.auto_cleanup or allow_empty != MONITOR.allow_empty):
             raise ValueError('Мониторинг остановлен или прокси изменился.')
         if STATE['phase'] in ACTIVE_PHASES:
             raise ValueError('Дождитесь завершения текущей операции.')
@@ -383,7 +385,7 @@ def start_scan(body,generation=None):
         ADD_PREVIEW = None
         if generation is not None:
             MONITOR.started(time.monotonic())
-    threading.Thread(target=run_scan,args=(target,timeout,repeat,chosen,auto,generation),daemon=True).start()
+    threading.Thread(target=run_scan,args=(target,timeout,repeat,chosen,auto,generation,allow_empty),daemon=True).start()
 
 def load_monitor_settings():
     try:
@@ -433,7 +435,8 @@ def monitor_operation(path,body):
             raise ValueError('Некорректный таймаут.')
         interval=validate_interval(body.get('interval',MONITOR.interval))
         save_monitor_interval(interval)
-        MONITOR.start(LAST,timeout,time.monotonic(),interval,auto)
+        allow_empty=body.get('allow_empty',False)
+        MONITOR.start(LAST,timeout,time.monotonic(),interval,auto,allow_empty)
         return MONITOR.public(time.monotonic())
 
 def monitor_loop():
@@ -445,8 +448,9 @@ def monitor_loop():
             generation=MONITOR.generation
             timeout=MONITOR.timeout
             auto=MONITOR.auto_cleanup
+            allow_empty=MONITOR.allow_empty
         try:
-            start_scan({'mode':'all','link':'','timeout':timeout,'repeat':True,'auto_cleanup':auto},generation)
+            start_scan({'mode':'all','link':'','timeout':timeout,'repeat':True,'auto_cleanup':auto,'allow_empty':allow_empty},generation)
         except (ValueError,OSError) as exc:
             with LOCK:
                 if MONITOR.enabled and MONITOR.generation==generation and STATE['phase'] not in ACTIVE_PHASES:
@@ -469,7 +473,7 @@ def dns_operation(path,body):
             DNS_PREVIEW=None
             ADD_PREVIEW=None
             return dynadot.save_config(body)
-        if old!='done' or not state['host'] or not state['rows']:
+        if old!='done' or not state['host']:
             raise ValueError('Сначала завершите проверку прокси.')
         if path=='/api/dynadot/preview':
             c,sub,g,records=dynadot.preview(state)

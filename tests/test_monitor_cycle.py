@@ -64,6 +64,15 @@ class MonitorTests(unittest.TestCase):
             self.m.start(self.target,10,100,120,'true')
         self.assertFalse(self.m.enabled)
 
+    def test_full_cleanup_explicit_only(self):
+        self.m.stop()
+        with self.assertRaises(ValueError):
+            self.m.start(self.target,10,100,120,False,True)
+        self.m.start(self.target,10,100,120,True,True)
+        self.assertTrue(self.m.public(100)['allow_empty'])
+        self.m.stop()
+        self.assertFalse(self.m.public(100)['allow_empty'])
+
     def test_commit_blocks_restart(self):
         self.m.committing=True
         self.m.stop()

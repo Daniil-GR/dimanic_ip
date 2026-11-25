@@ -20,6 +20,14 @@ class AutoTests(unittest.TestCase):
     def test_all_fail(self):
         self.assertEqual(plan(self.ips,[row(ip,False,False) for ip in self.ips],set())[0],[])
 
+    def test_all_down_explicit_permission(self):
+        rows=[dict(row(ip,False,False,'DOWN'),first_api_status='DOWN') for ip in self.ips]
+        self.assertEqual(plan(self.ips,rows,set())[0],[])
+        self.assertEqual(plan(self.ips,rows,set(),True)[0],self.ips)
+        self.assertEqual(plan(self.ips,rows,{self.ips[0]},True)[0],self.ips[1:])
+        rows[0]['local_data']=None
+        self.assertEqual(plan(self.ips,rows,set(),True)[0],[])
+
     def test_unknown_and_partial(self):
         self.assertEqual(plan(self.ips,self.rows[:2],set())[0],[])
         self.assertEqual(plan(self.ips,self.rows[:2]+[row(self.ips[2],False,None,'API_ERROR')],set())[0],[])

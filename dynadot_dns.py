@@ -374,11 +374,11 @@ def preview(state):
                         'eligible':row.get('local_data') is False})
     return c,sub,g,records
 
-def remove(c,sub,g,selected):
+def remove(c,sub,g,selected,allow_empty=False):
     if not selected or len(set(selected))!=len(selected):
         raise ValueError('Выберите уникальные IPv4.')
     found=matching(g,sub)
-    if not set(selected)<=set(found) or len(found)<=len(selected):
+    if not set(selected)<=set(found) or (not allow_empty and len(found)<=len(selected)):
         raise ValueError('DNS изменился или выбрана последняя A-запись. Удаление запрещено.')
     fresh=get_zone(c)
     if canonical(fresh)!=canonical(g):
