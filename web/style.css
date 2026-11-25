@@ -8,3 +8,5 @@
 .paused-tone{color:#c1a7fa}.node.paused-tone{border-color:#8d71c9;background:#1c1930}.pause-action{color:#c1a7fa}.stats{grid-template-columns:repeat(auto-fit,minmax(145px,1fr))}@media(max-width:520px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
 
 .monitor-settings{display:grid;gap:10px;margin:16px 0 20px;padding:14px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}#monitorInterval{width:100px}.monitor-option{display:flex;align-items:center;gap:9px;font-weight:550}.monitor-option input{margin:0}
+
+.history-stats{padding:12px 14px;margin-bottom:16px;border:1px solid var(--line);border-radius:10px;color:var(--muted);background:#101a29}#ipHistory .controls{margin-bottom:16px}#ipHistory td small{display:block}

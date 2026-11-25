@@ -159,6 +159,12 @@ def load_page(page_id):
 
 def start_worker(module):
     threading.Thread(target=module.monitor_loop, daemon=True).start()
+    def import_history():
+        try:
+            module.ip_history.import_reports(module.HISTORY,module.REPORTS)
+        except (OSError,module.sqlite3.Error) as exc:
+            module.change(history_error='Не удалось импортировать архив отчётов: '+str(exc))
+    threading.Thread(target=import_history,daemon=True).start()
 
 
 def create_page():

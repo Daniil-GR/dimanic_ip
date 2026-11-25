@@ -19,3 +19,5 @@ paused_ipv4.json.*.tmp
 
 monitor_settings.json
 monitor_settings.json.*.tmp
+
+ipv4_history.sqlite3*

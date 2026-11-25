@@ -263,7 +263,12 @@ $('addCheck').onclick=()=>{
   dnsCall(async()=>{
     try{
       addition=await post('/api/dynadot/add-preview',{ips:$('addIps').value});
-      $('addRows').innerHTML=addition.ips.map(ip=>'<tr><td><input type="checkbox" data-add-ip="'+esc(ip)+'" checked aria-label="Выбрать '+esc(ip)+'"></td><td>'+esc(ip)+'</td><td class="neutral">Новая A-запись · MTProto не проверен</td></tr>').join('');
+      $('addRows').innerHTML=addition.ips.map(ip=>{
+        const history=(addition.history||[]).filter(r=>r.ip===ip);
+        const unresolved=history.filter(r=>!r.recovered);
+        const warning=unresolved.length?'Есть неподтверждённые восстановлением отказы: '+unresolved.map(r=>(r.status||'DNS_REMOVED')+' / '+r.host+' / '+historyDate(r.last_failure||r.removed_at)).join('; '):history.length?'Ранее был недоступен; затем RU снова отвечала.':'Новая A-запись · MTProto не проверен';
+        return '<tr><td><input type="checkbox" data-add-ip="'+esc(ip)+'" '+(unresolved.length?'':'checked')+' aria-label="Выбрать '+esc(ip)+'"></td><td>'+esc(ip)+'</td><td class="'+(unresolved.length?'warn':'neutral')+'">'+esc(warning)+'</td></tr>';
+      }).join('');
       $('addPreview').hidden=!addition.ips.length;
       addMsg('Готово к добавлению: '+addition.ips.length+' · TTL '+addition.ttl+' сек. '+(addition.duplicates.length?'Уже в DNS: '+addition.duplicates.join(', '):''));
     }catch(e){clearAddition();addMsg(e.message);}
@@ -363,5 +368,38 @@ $('workspaceNew').onclick=async()=>{
     await refreshWorkspaces();
   }
 };
+let historyRows=[],historyBusy=false;
+const historyDate=v=>v?new Date(v).toLocaleDateString('ru-RU'):'—';
+const historyDue=r=>!!r.review_from&&Date.parse(r.review_from)<=Date.now();
+function renderHistory(){
+  const search=$('historySearch').value.trim().toLowerCase(),f=$('historyFilter').value;
+  const rows=historyRows.filter(r=>(r.ip+' '+r.host).toLowerCase().includes(search)&&(
+    f==='all'||f==='blocked'&&r.suspected_block&&!r.recovered||f==='failed'&&!r.suspected_block&&!r.recovered||
+    f==='recovered'&&r.recovered||f==='review'&&historyDue(r)||f==='removed'&&r.removed_at));
+  const count=rs=>new Set(rs.map(r=>r.ip)).size;
+  $('historyStats').textContent='IPv4 в архиве: '+count(historyRows)+' · Вероятная блокировка: '+count(historyRows.filter(r=>r.suspected_block&&!r.recovered))+' · Пора перепроверить: '+count(historyRows.filter(historyDue));
+  $('historyRows').innerHTML=rows.map(r=>{
+    const status=r.recovered?'RU восстановлена':r.suspected_block?'Вероятная блокировка':r.status?'Недоступен при проверке':'Удалён из DNS';
+    const review=r.recovered?'Доступность наблюдалась':r.review_from?historyDate(r.review_from)+' — '+historyDate(r.review_to)+(historyDue(r)?' · пора перепроверить':''):'Нет оценки срока';
+    return '<tr><td>'+esc(r.ip)+'<small>'+esc(r.host)+':'+esc(r.port)+'</small></td><td class="'+(r.recovered?'ok':r.suspected_block?'bad':'warn')+'">'+esc(status)+'<small>'+esc(r.status||'—')+' · NL '+esc(r.ext===1?'Да':r.ext===0?'Нет':'—')+'</small></td><td>'+esc(historyDate(r.first_failure))+' / '+esc(historyDate(r.last_failure))+'<small>Двойных отказов: '+esc(r.failures)+'</small></td><td>'+esc(historyDate(r.removed_at))+'</td><td>'+esc(review)+'</td></tr>';
+  }).join('');
+  $('historyMessage').textContent=state.history_error||(!rows.length?'Нет подходящих записей. Архив пополняется проверками и импортом сохранённых отчётов.':'Показано записей: '+rows.length);
+}
+async function refreshHistory(){
+  if(historyBusy)return;
+  historyBusy=true;
+  try{
+    const response=await fetch('api/ip-history',{cache:'no-store'});
+    const data=await response.json();
+    if(!response.ok)throw Error(data.error||'Не удалось загрузить архив.');
+    historyRows=data.entries;
+    renderHistory();
+  }catch(e){$('historyMessage').textContent=e.message;}
+  finally{historyBusy=false;}
+}
+$('historySearch').addEventListener('input',renderHistory);
+$('historyFilter').addEventListener('change',renderHistory);
+$('historyRefresh').onclick=refreshHistory;
+refreshHistory();setInterval(refreshHistory,15000);
 refreshWorkspaces();setInterval(refreshWorkspaces,2000);
 poll();setInterval(poll,1000);

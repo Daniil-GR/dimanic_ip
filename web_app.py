@@ -3,6 +3,8 @@ import argparse
 import dynadot_dns as dynadot
 import dynadot_add as dns_add
 import auto_dns
+import ip_history
+import sqlite3
 import pause_store
 from monitor_cycle import Monitor, INTERVAL, validate_interval
 import copy
@@ -26,12 +28,13 @@ ROOT = Path(__file__).resolve().parent
 REPORTS = CONFIG.parent / 'reports'
 LAST_PROXY = CONFIG.parent / 'last_proxy.json'
 PROTECTED = CONFIG.parent / 'protected_ipv4.json'
+HISTORY = CONFIG.parent / 'ipv4_history.sqlite3'
 TOKEN = secrets.token_urlsafe(32)
 LOCK = threading.Lock()
 MONITOR = Monitor()
 ACTIVE_PHASES = ('dns','checking','saving','key')
 STATE = {'phase':'idle','rows':[], 'ips':[], 'host':'', 'port':None, 'source':'',
-         'current':'', 'done':0, 'total':0, 'error':'', 'started_at':'', 'finished_at':'', 'scan_id':'', 'auto_result':None}
+         'current':'', 'done':0, 'total':0, 'error':'', 'started_at':'', 'finished_at':'', 'scan_id':'', 'auto_result':None,'history_error':''}
 LAST = None
 CLIENT = None
 DNS_PREVIEW = None
@@ -200,6 +203,11 @@ def apply_auto_cleanup(c,sub,zone,host,ips,rows,protected,generation=None,target
         result.update(status='removed',message='Удаление подтверждено Dynadot.',
                       removed=deleted['removed'],backup=deleted['backup'],
                       measurements=[r for r in rows if r['ip'] in selected])
+        result['removed_at']=now()
+        try:
+            ip_history.removed(HISTORY,host,target[1] if target else snapshot()['port'],deleted['removed'],result['removed_at'],c['mode'])
+        except (OSError,sqlite3.Error) as exc:
+            change(history_error='DNS удалён, но запись события в архив не удалась: '+str(exc))
         remaining=deleted['remaining']
         change(rows=[r for r in snapshot()['rows'] if r['ip'] in remaining],ips=remaining,
                done=len(remaining),total=len(remaining),
@@ -274,6 +282,13 @@ def run_scan(target, timeout, repeat, chosen=None, auto=False, generation=None):
                 active_ips,active_rows=pause_store.active_pool(ips,rows,excluded)
             # Only measurements of non-paused addresses made in this run may release protection.
             protected=auto_dns.release_healthy(PROTECTED,host,active_rows,dynadot.private_write)
+            try:
+                ip_history.record(HISTORY,host,port,active_rows,now())
+                change(history_error='')
+            except (OSError,sqlite3.Error) as exc:
+                change(history_error='Не удалось сохранить архив IPv4: '+str(exc))
+                if auto:
+                    raise ValueError('Архив недоступен. Автоудаление отменено.') from None
             if auto:
                 change(current='Проверка условий автоудаления')
                 if not active_ips:
@@ -484,6 +499,10 @@ def dns_operation(path,body):
                 raise ValueError('Домен в Dynadot изменился. Обновите список.')
             result=dynadot.remove(p[3],p[4],p[5],selected)
             # Keep the original measurements, but invalidate the current preview.
+            try:
+                ip_history.removed(HISTORY,state['host'],state['port'],result['removed'],now(),p[3]['mode'])
+            except (OSError,sqlite3.Error) as exc:
+                change(history_error='DNS удалён, но запись события в архив не удалась: '+str(exc))
             return result
         if path=='/api/dynadot/add-preview':
             ADD_PREVIEW=None
@@ -494,7 +513,8 @@ def dns_operation(path,body):
             token=secrets.token_urlsafe(24)
             ADD_PREVIEW=(token,time.monotonic(),state['scan_id'],(state['host'],state['port']),c,sub,g,new)
             return {'token':token,'host':state['host'],'zone':c['zone'],'mode':c['mode'],
-                    'ttl':dns_add.current_ttl(g),'duplicates':duplicates,'ips':new}
+                    'ttl':dns_add.current_ttl(g),'duplicates':duplicates,'ips':new,
+                    'history':[r for r in ip_history.entries(HISTORY) if r['ip'] in new]}
         if path=='/api/dynadot/add':
             p=ADD_PREVIEW
             ADD_PREVIEW=None
@@ -583,6 +603,16 @@ class Handler(BaseHTTPRequestHandler):
                     data['protection_error'] = str(exc)
                 data['can_repeat'] = LAST is not None and (LAST[0],LAST[1]) == (STATE['host'],STATE['port'])
             self.out(data)
+        elif self.path == '/api/ip-history':
+            try:
+                self.out({'entries':ip_history.entries(HISTORY)})
+            except (OSError,sqlite3.Error) as exc:
+                self.out({'error':'Архив IPv4 недоступен: '+str(exc)},500)
+        elif self.path == '/export-history.json':
+            try:
+                self.send(200,json.dumps(ip_history.events(HISTORY),ensure_ascii=False,indent=2).encode(),'application/json; charset=utf-8','ipv4-history.json')
+            except (OSError,sqlite3.Error) as exc:
+                self.out({'error':'Архив IPv4 недоступен: '+str(exc)},500)
         elif self.path == '/export.json':
             self.send(200,json.dumps(snapshot(),ensure_ascii=False,indent=2).encode(),'application/json; charset=utf-8','proxy-check.json')
         elif self.path == '/export.csv':
@@ -627,7 +657,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.out({'ok':True})
             else:
                 self.out({'error':'Not found'},404)
-        except (ValueError,ApiError,OSError) as e:
+        except (ValueError,ApiError,OSError,sqlite3.Error) as e:
             self.out({'error':str(e)},400)
 
 def main():
