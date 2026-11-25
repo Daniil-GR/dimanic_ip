@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT="$DIR/check_proxy.py"
+SCRIPT="$DIR/web_app.py"
+if [[ "${1:-}" == "--cli" ]]; then
+  shift
+  SCRIPT="$DIR/check_proxy.py"
+elif [[ "${1:-}" == "--reset-key" || "${1:-}" == "--key-only" ]]; then
+  SCRIPT="$DIR/check_proxy.py"
+fi
 if command -v cygpath >/dev/null 2>&1; then
   SCRIPT="$(cygpath -w "$SCRIPT")"
 fi

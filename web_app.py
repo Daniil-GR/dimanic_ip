@@ -1,0 +1,293 @@
+"""Local browser dashboard. Start with python web_app.py."""
+import argparse
+import copy
+import csv
+import io
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import threading
+import webbrowser
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from check_proxy import API, ApiError, CONFIG, parse_link, resolve_ips, field, safe_result
+
+ROOT = Path(__file__).resolve().parent
+REPORTS = CONFIG.parent / 'reports'
+TOKEN = secrets.token_urlsafe(32)
+LOCK = threading.Lock()
+STATE = {'phase':'idle','rows':[], 'ips':[], 'host':'', 'port':None, 'source':'',
+         'current':'', 'done':0, 'total':0, 'error':'', 'started_at':'', 'finished_at':''}
+LAST = None
+CLIENT = None
+FIELDS = ('tcp','handshake','data','ssh','ping_ms','latency_ms','duration_ms')
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+def client():
+    global CLIENT
+    key = CONFIG.read_text(encoding='utf-8').strip() if CONFIG.is_file() else ''
+    if not key:
+        raise ValueError('Сначала сохраните API-ключ.')
+    if CLIENT is None or CLIENT.key != key:
+        CLIENT = API(key)
+    return CLIENT
+
+def save_key(key):
+    global CLIENT
+    if not isinstance(key,str) or not re.fullmatch(r'rf_[A-Za-z0-9_-]+',key):
+        raise ValueError('Некорректный формат API-ключа.')
+    api = API(key)
+    api.call('/v1/me')
+    CONFIG.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = CONFIG.with_name('key-' + secrets.token_hex(8))
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd,'w',encoding='utf-8') as f:
+            f.write(key+'\n')
+        os.replace(tmp,CONFIG)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    CLIENT = api
+
+def change(**values):
+    with LOCK:
+        STATE.update(values)
+
+def row_for(ip, port, first, second):
+    last = second if second is not None else first
+    ru = field(last,'local','data')
+    ext = field(last,'remote','data')
+    previous = field(first,'local','data')
+    if ru is True:
+        status = 'RU_OK' if ext is True else 'RU_OK_EXT_FAIL' if ext is False else 'RU_OK_EXT_UNKNOWN'
+        action = 'KEEP'
+    elif ru is False:
+        status = 'RU_UNAVAILABLE' if ext is True else 'UNAVAILABLE' if ext is False else 'NEEDS_CHECK'
+        action = 'REVIEW_DNS' if second is not None and previous is False else 'RECHECK'
+    else:
+        status,action = 'NEEDS_CHECK','RECHECK'
+    row = {'ip':ip,'port':port,'status':status,'api_status':last['status'],
+           'first_api_status':first['status'],'first_ru_data':previous,
+           'first_ext_data':field(first,'remote','data'),
+           'recheck':second['status'] if second else '', 'action':action,
+           'checked_at':last.get('checked_at','')}
+    for side in ('local','remote'):
+        for key in FIELDS:
+            row[side+'_'+key] = field(last,side,key)
+    return row
+
+def csv_bytes(rows):
+    f = io.StringIO(newline='')
+    if rows:
+        writer = csv.DictWriter(f,fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    return f.getvalue().encode('utf-8-sig')
+
+def snapshot():
+    with LOCK:
+        return copy.deepcopy(STATE)
+
+def save_report():
+    report = snapshot()
+    REPORTS.mkdir(parents=True,exist_ok=True,mode=0o700)
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')
+    for name,data in [('proxy-check-'+stamp+'.json',json.dumps(report,ensure_ascii=False,indent=2).encode()),
+                      ('proxy-check-'+stamp+'.csv',csv_bytes(report['rows']))]:
+        (REPORTS/name).write_bytes(data)
+    tmp = REPORTS/'latest.tmp'
+    tmp.write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+    os.replace(tmp,REPORTS/'latest.json')
+
+def run_scan(target, timeout, repeat, chosen=None):
+    global LAST
+    host,port,secret = target
+    try:
+        api = client()
+        if chosen is None:
+            ips,source = resolve_ips(host)
+            change(ips=ips,source=source,total=len(ips),phase='checking')
+        else:
+            ips = chosen
+            change(total=len(ips),phase='checking')
+        with LOCK:
+            LAST = target
+        for i,ip in enumerate(ips,1):
+            change(current=ip)
+            first = safe_result(api,ip,port,secret,timeout)
+            second = None
+            if repeat and field(first,'local','data') is not True:
+                change(current=ip+' · повтор')
+                second = safe_result(api,ip,port,secret,timeout)
+            row = row_for(ip,port,first,second)
+            with LOCK:
+                STATE['rows'] = [r for r in STATE['rows'] if r['ip'] != ip] + [row]
+                order = {v:j for j,v in enumerate(STATE['ips'])}
+                STATE['rows'].sort(key=lambda r:order.get(r['ip'],0))
+                STATE['done'] = i
+        change(phase='saving',current='',finished_at=now())
+        # Persist a finished snapshot while preventing concurrent scans until write completes.
+        report = snapshot()
+        report['phase'] = 'done'
+        REPORTS.mkdir(parents=True,exist_ok=True,mode=0o700)
+        stamp = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S-%f')
+        raw = json.dumps(report,ensure_ascii=False,indent=2).encode()
+        (REPORTS/('proxy-check-'+stamp+'.json')).write_bytes(raw)
+        (REPORTS/('proxy-check-'+stamp+'.csv')).write_bytes(csv_bytes(report['rows']))
+        tmp = REPORTS/'latest.tmp'
+        tmp.write_bytes(raw)
+        os.replace(tmp,REPORTS/'latest.json')
+        change(phase='done')
+    except (ValueError,ApiError,OSError) as e:
+        change(phase='error',error=str(e),current='',finished_at=now())
+    except Exception:
+        change(phase='error',error='Внутренняя ошибка проверки. Частичные результаты сохранены в памяти.',current='',finished_at=now())
+
+def start_scan(body):
+    link = body.get('link','')
+    if not isinstance(link,str) or len(link)>8192:
+        raise ValueError('Некорректная ссылка.')
+    timeout = body.get('timeout',10)
+    if type(timeout) is not int or not 1 <= timeout <= 15:
+        raise ValueError('Таймаут должен быть от 1 до 15 секунд.')
+    repeat = body.get('repeat',True) is True
+    mode = body.get('mode','all')
+    with LOCK:
+        if STATE['phase'] in ('dns','checking','saving','key'):
+            raise ValueError('Дождитесь завершения текущей операции.')
+        if not CONFIG.is_file():
+            raise ValueError('Сначала сохраните API-ключ.')
+        target = parse_link(link) if link else LAST
+        if target is None:
+            raise ValueError('Вставьте MTProto-ссылку.')
+        if mode == 'all':
+            chosen = None
+            STATE.update(host=target[0],port=target[1],rows=[],ips=[],source='',total=0,phase='dns')
+        elif mode in ('one','failed'):
+            if LAST is None or target != LAST:
+                raise ValueError('Для повтора используйте последний проверенный прокси.')
+            chosen = ([body.get('ip')] if mode == 'one' else
+                      [r['ip'] for r in STATE['rows'] if r['local_data'] is not True])
+            if not chosen or any(ip not in STATE['ips'] for ip in chosen):
+                raise ValueError('Нет подходящих IP для повтора.')
+            STATE.update(phase='checking',total=len(chosen))
+        else:
+            raise ValueError('Неизвестный режим.')
+        STATE.update(done=0,current='',error='',started_at=now(),finished_at='')
+    threading.Thread(target=run_scan,args=(target,timeout,repeat,chosen),daemon=True).start()
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self,*args):
+        pass
+
+    def allowed(self):
+        return self.headers.get('Host') == '127.0.0.1:'+str(self.server.server_port)
+
+    def send(self, code, data, kind='application/json; charset=utf-8', filename=None):
+        self.send_response(code)
+        self.send_header('Content-Type',kind)
+        self.send_header('Content-Length',str(len(data)))
+        self.send_header('Cache-Control','no-store')
+        self.send_header('X-Content-Type-Options','nosniff')
+        self.send_header('X-Frame-Options','DENY')
+        self.send_header('Referrer-Policy','no-referrer')
+        self.send_header('Content-Security-Policy',"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
+        if filename:
+            self.send_header('Content-Disposition','attachment; filename="'+filename+'"')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def out(self, obj, code=200):
+        self.send(code,json.dumps(obj,ensure_ascii=False).encode())
+
+    def do_GET(self):
+        if not self.allowed():
+            return self.out({'error':'Invalid host'},403)
+        if self.path == '/':
+            self.send(200,(ROOT/'web'/'index.html').read_text(encoding='utf-8').replace('__TOKEN__',TOKEN).encode(),'text/html; charset=utf-8')
+        elif self.path in ('/style.css','/app.js'):
+            self.send(200,(ROOT/'web'/self.path[1:]).read_bytes(),'text/css; charset=utf-8' if self.path.endswith('.css') else 'text/javascript; charset=utf-8')
+        elif self.path == '/api/state':
+            data = snapshot()
+            data['has_key'] = CONFIG.is_file()
+            with LOCK:
+                data['can_repeat'] = LAST is not None
+            self.out(data)
+        elif self.path == '/export.json':
+            self.send(200,json.dumps(snapshot(),ensure_ascii=False,indent=2).encode(),'application/json; charset=utf-8','proxy-check.json')
+        elif self.path == '/export.csv':
+            self.send(200,csv_bytes(snapshot()['rows']),'text/csv; charset=utf-8','proxy-check.csv')
+        else:
+            self.out({'error':'Not found'},404)
+
+    def do_POST(self):
+        origin = 'http://127.0.0.1:'+str(self.server.server_port)
+        if not self.allowed() or self.headers.get('Origin') != origin or self.headers.get('X-Local-Token') != TOKEN:
+            return self.out({'error':'Forbidden'},403)
+        try:
+            n = int(self.headers.get('Content-Length','0'))
+            if not 0 < n <= 16384 or self.headers.get_content_type() != 'application/json':
+                raise ValueError('Некорректный запрос.')
+            body = json.loads(self.rfile.read(n))
+            if not isinstance(body,dict):
+                raise ValueError('Некорректный запрос.')
+            if self.path == '/api/check':
+                start_scan(body)
+                self.out({'ok':True},202)
+            elif self.path == '/api/key':
+                with LOCK:
+                    if STATE['phase'] in ('dns','checking','saving','key'):
+                        raise ValueError('Дождитесь завершения текущей операции.')
+                    old = STATE['phase']
+                    STATE['phase'] = 'key'
+                try:
+                    save_key(body.get('key'))
+                finally:
+                    change(phase=old)
+                self.out({'ok':True})
+            else:
+                self.out({'error':'Not found'},404)
+        except (ValueError,ApiError,OSError) as e:
+            self.out({'error':str(e)},400)
+
+def main():
+    p = argparse.ArgumentParser(description='Локальный MTProto dashboard')
+    p.add_argument('--port',type=int,default=8765)
+    p.add_argument('--no-browser',action='store_true')
+    args = p.parse_args()
+    if not 1 <= args.port <= 65535:
+        p.error('Некорректный порт')
+    latest = REPORTS/'latest.json'
+    if latest.is_file():
+        try:
+            old = json.loads(latest.read_text(encoding='utf-8'))
+            if isinstance(old,dict) and isinstance(old.get('rows'),list):
+                STATE.update({k:old[k] for k in STATE if k in old})
+                STATE.update(phase='done',current='',error='')
+        except (OSError,ValueError):
+            pass
+    try:
+        server = ThreadingHTTPServer(('127.0.0.1',args.port),Handler)
+    except OSError:
+        print('Порт занят. Закройте предыдущий запуск или укажите --port 8766.')
+        return 1
+    url = 'http://127.0.0.1:'+str(server.server_port)
+    print('Локальный dashboard: '+url+'\nДля остановки нажмите Ctrl+C.')
+    if not args.no_browser:
+        threading.Thread(target=webbrowser.open,args=(url,),daemon=True).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+if __name__ == '__main__':
+    raise SystemExit(main())

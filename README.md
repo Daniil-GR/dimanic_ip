@@ -1,3 +1,15 @@
+# dimanic_ip — MTProto Monitor
+
+## Локальный сайт (режим по умолчанию)
+
+Windows: `py -3 -m pip install -r requirements.txt`, затем ` .\check-proxy.cmd` (без начального пробела). Linux: установите зависимости в venv и выполните `bash check-proxy.sh`.
+
+Откроется http://127.0.0.1:8765. В браузере можно сохранить/заменить API-ключ, вставить MTProto-ссылку, запустить проверку всех A-записей, следить за прогрессом, повторить отдельный IP или проблемные IP, фильтровать таблицу, смотреть интерактивную топологию и скачать CSV/JSON. Повтор всех адресов с пустым полем использует предыдущую ссылку только в рамках текущего процесса. После перезапуска ссылку нужно ввести заново. API-ключ хранится там же, где прежде. Secret хранится в памяти, не в отчёте. Сервер слушает только loopback; для остановки Ctrl+C. Опции: `--port 8766`, `--no-browser`.
+
+Отчёты сохраняются в папке `reports` рядом с локальным файлом API-ключа. Последний отчёт открывается после перезапуска. Отдельно отображаются RU/EXT и оригинальный статус API. RU data=true означает успех с российской точки. Повторные RU data=false дают REVIEW_DNS, а не доказательство блокировки; DNS не изменяется. При null нужна ручная диагностика. Консольный режим сохранён: `py -3 check_proxy.py` или `python3 check_proxy.py` (также `--cli` у обёрток).
+
+## Справка по прежнему консольному режиму
+
 # dimanic_ip — MTProto IPv4 checker
 
 Проверяет каждый IPv4 из A-записей MTProto-домена через API RU + внешняя нода. Не изменяет DNS.
@@ -8,10 +20,10 @@
 
 ```powershell
 py -3 -m pip install -r requirements.txt
-.\check-proxy.cmd
+.\check-proxy.cmd --cli
 ```
 
-В Git Bash: `bash check-proxy.sh`. Если скрытый ввод в Git Bash не работает, использовать PowerShell и `.cmd`.
+В Git Bash: `bash check-proxy.sh --cli`. Если скрытый ввод в Git Bash не работает, использовать PowerShell и `.cmd`.
 
 ## Linux
 
@@ -19,7 +31,7 @@ py -3 -m pip install -r requirements.txt
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-bash check-proxy.sh
+bash check-proxy.sh --cli
 ```
 
 В Ubuntu при отсутствии venv: `sudo apt install python3-venv`.
