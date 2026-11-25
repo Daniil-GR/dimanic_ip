@@ -4,7 +4,7 @@ import dynadot_dns as dynadot
 import dynadot_add as dns_add
 import auto_dns
 import pause_store
-from monitor_cycle import Monitor, INTERVAL
+from monitor_cycle import Monitor, INTERVAL, validate_interval
 import copy
 import csv
 import io
@@ -323,7 +323,7 @@ def start_scan(body,generation=None):
     with LOCK:
         if MONITOR.enabled and generation is None:
             raise ValueError('Остановите мониторинг перед ручной проверкой.')
-        if generation is not None and not MONITOR.matches(generation,LAST):
+        if generation is not None and (not MONITOR.matches(generation,LAST) or auto != MONITOR.auto_cleanup):
             raise ValueError('Мониторинг остановлен или прокси изменился.')
         if STATE['phase'] in ACTIVE_PHASES:
             raise ValueError('Дождитесь завершения текущей операции.')
@@ -370,25 +370,55 @@ def start_scan(body,generation=None):
             MONITOR.started(time.monotonic())
     threading.Thread(target=run_scan,args=(target,timeout,repeat,chosen,auto,generation),daemon=True).start()
 
+def load_monitor_settings():
+    try:
+        data=json.loads((LAST_PROXY.parent/'monitor_settings.json').read_text(encoding='utf-8'))
+        MONITOR.interval=validate_interval(data['interval'])
+    except FileNotFoundError:
+        pass
+    except (OSError,ValueError,KeyError,TypeError):
+        MONITOR.interval=INTERVAL
+        MONITOR.message='Не удалось восстановить интервал. Установлено 2 минуты.'
+
+def save_monitor_interval(interval):
+    dynadot.private_write(LAST_PROXY.parent/'monitor_settings.json',{'interval':validate_interval(interval)})
+
 def monitor_operation(path,body):
     with LOCK:
         if path=='/api/monitor/stop':
             committing=MONITOR.committing
-            MONITOR.stop('Мониторинг остановлен. Уже начатая DNS-операция завершится.' if committing else 'Мониторинг остановлен. Новые удаления не запускаются.')
+            MONITOR.stop('Мониторинг остановлен. Уже начатая DNS-операция завершится.' if committing else 'Мониторинг остановлен. Новые проверки и удаления не запускаются.')
             return MONITOR.public(time.monotonic())
-        if STATE['phase'] in ACTIVE_PHASES:
-            raise ValueError('Дождитесь завершения текущей операции.')
+        if path=='/api/monitor/interval':
+            interval=validate_interval(body.get('interval'))
+            save_monitor_interval(interval)
+            MONITOR.set_interval(interval,time.monotonic())
+            MONITOR.message='Интервал сохранён.'
+            return MONITOR.public(time.monotonic())
+        if path!='/api/monitor/start':
+            raise ValueError('Неизвестная операция мониторинга.')
+        if MONITOR.enabled or MONITOR.committing or STATE['phase'] in ACTIVE_PHASES:
+            raise ValueError('Дождитесь завершения текущей операции или остановите мониторинг.')
         if LAST is None or LAST[:2]!=(STATE['host'],STATE['port']):
             raise ValueError('Сначала выполните проверку нужного прокси.')
         if body.get('host')!=LAST[0] or body.get('port')!=LAST[1]:
             raise ValueError('Текущий прокси изменился. Обновите страницу.')
-        if not CONFIG.is_file() or dynadot.config()['mode']!='production':
-            raise ValueError('Нужны действующие API-ключи проверки и Production Dynadot.')
+        if not CONFIG.is_file():
+            raise ValueError('Сначала сохраните API-ключ проверки.')
+        auto=body.get('auto_cleanup',False)
+        if type(auto) is not bool:
+            raise ValueError('Некорректный режим автоудаления.')
+        if auto:
+            if dynadot.config()['mode']!='production':
+                raise ValueError('Для автоудаления нужен Production Dynadot.')
+            auto_dns.read_protected(PROTECTED)
+        paused(LAST[0])
         timeout=body.get('timeout',10)
         if type(timeout) is not int or not 1<=timeout<=15:
             raise ValueError('Некорректный таймаут.')
-        auto_dns.read_protected(PROTECTED)
-        MONITOR.start(LAST,timeout,time.monotonic())
+        interval=validate_interval(body.get('interval',MONITOR.interval))
+        save_monitor_interval(interval)
+        MONITOR.start(LAST,timeout,time.monotonic(),interval,auto)
         return MONITOR.public(time.monotonic())
 
 def monitor_loop():
@@ -399,12 +429,13 @@ def monitor_loop():
                 continue
             generation=MONITOR.generation
             timeout=MONITOR.timeout
+            auto=MONITOR.auto_cleanup
         try:
-            start_scan({'mode':'all','link':'','timeout':timeout,'repeat':True,'auto_cleanup':True},generation)
+            start_scan({'mode':'all','link':'','timeout':timeout,'repeat':True,'auto_cleanup':auto},generation)
         except (ValueError,OSError) as exc:
             with LOCK:
                 if MONITOR.enabled and MONITOR.generation==generation and STATE['phase'] not in ACTIVE_PHASES:
-                    MONITOR.next_due=time.monotonic()+INTERVAL
+                    MONITOR.next_due=time.monotonic()+MONITOR.interval
                     MONITOR.message=str(exc)
 
 def dns_operation(path,body):
@@ -572,7 +603,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('Некорректный запрос.')
             if self.path in ('/api/dynadot/config','/api/dynadot/preview','/api/dynadot/delete','/api/dynadot/add-preview','/api/dynadot/add'):
                 self.out(dns_operation(self.path,body))
-            elif self.path in ('/api/monitor/start','/api/monitor/stop'):
+            elif self.path in ('/api/monitor/start','/api/monitor/stop','/api/monitor/interval'):
                 self.out(monitor_operation(self.path,body))
             elif self.path == '/api/ipv4/pause':
                 self.out(pause_operation(body))
@@ -607,6 +638,7 @@ def main():
     args = p.parse_args()
     if not 1 <= args.port <= 65535:
         p.error('Некорректный порт')
+    load_monitor_settings()
     latest = REPORTS/'latest.json'
     if latest.is_file():
         try:

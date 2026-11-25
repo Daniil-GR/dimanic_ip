@@ -1,6 +1,8 @@
 'use strict';
 const $=id=>document.getElementById(id), token=document.querySelector('meta[name=local-token]').content;
 let state={rows:[],ips:[]}, busy=false, lastRender='', lastKey=null, pauseBusy=false;
+let monitorIntervalSeen=null,monitorIntervalDirty=false,monitorBusy=false;
+const intervalValue=()=>{const v=Number($('monitorInterval').value);return Number.isInteger(v)&&v>=1&&v<=1440?v*60:null;};
 const isPaused=ip=>(state.paused||[]).includes(ip);
 const isProtected=ip=>(state.protected||[]).includes(ip);
 const pauseLocked=()=>pauseBusy||!!state.pause_error||!!state.pause_committing||['key','saving'].includes(state.phase);
@@ -30,8 +32,17 @@ function buttons(){
   dnsButtons();
   const monitoring=!!state.monitor?.enabled;
   const lock=busy||active()||monitoring;
-  $('monitorStart').disabled=lock||!state.has_key||!state.can_repeat||!state.dynadot?.configured||state.dynadot.mode!=='production'||!!state.monitor?.committing;
-  $('monitorStop').disabled=!monitoring;
+  const dnsReady=!!state.dynadot?.configured&&state.dynadot.mode==='production';
+  $('monitorCleanup').disabled=lock||monitorBusy||!dnsReady;
+  if(monitoring)$('monitorCleanup').checked=state.monitor.auto_cleanup===true;
+  else if(!dnsReady)$('monitorCleanup').checked=false;
+  const cleanup=$('monitorCleanup').checked;
+  $('monitorStart').textContent=cleanup?'Запустить мониторинг с автоудалением':'Запустить мониторинг';
+  $('monitorStart').disabled=lock||monitorBusy||!state.has_key||!state.can_repeat||!intervalValue()||!!state.monitor?.committing||(cleanup&&!dnsReady);
+  $('monitorStop').disabled=!monitoring||monitorBusy;
+  $('monitorSaveInterval').disabled=monitorBusy||!intervalValue()||intervalValue()===state.monitor?.interval;
+  $('monitorInterval').disabled=monitorBusy;
+  $('monitorModeHint').textContent=cleanup?'Автоудаление: два подтверждённых отказа RU независимо от NL. Паузы, защита новых VPS и защита от общего сбоя сохраняются.':dnsReady?'Обычный мониторинг: только проверка, DNS не изменяется.':'Обычный мониторинг доступен без Dynadot. Для автоудаления подключите Production Dynadot.';
   $('start').disabled=lock||!state.has_key;
   $('autoCleanup').disabled=lock||!state.dynadot?.configured||state.dynadot.mode!=='production';
   if(!state.dynadot?.configured||state.dynadot.mode!=='production')$('autoCleanup').checked=false;
@@ -124,7 +135,11 @@ function render(){
   const p=state.phase;
   const m=state.monitor||{};
   $('monitorTarget').textContent='Прокси: '+(m.enabled?m.host+':'+m.port:state.host?state.host+':'+state.port:'—');
-  $('monitorStatus').textContent=m.enabled?'Активен · автоудаление':'Остановлен';
+  if(Number.isInteger(m.interval)&&monitorIntervalSeen!==m.interval){
+    monitorIntervalSeen=m.interval;
+    if(!monitorIntervalDirty)$('monitorInterval').value=String(m.interval/60);
+  }
+  $('monitorStatus').textContent=m.enabled?(m.auto_cleanup?'Активен · автоудаление':'Активен · только проверка'):'Остановлен';
   $('monitorNext').textContent=m.enabled?(active()?'Проверка выполняется':'Следующая проверка через '+Math.floor((m.seconds||0)/60)+':'+String((m.seconds||0)%60).padStart(2,'0')):'';
   $('monitorMessage').textContent=m.message||'';
   const ar=state.auto_result;
@@ -279,16 +294,37 @@ $('addApply').onclick=()=>{
     }catch(e){addMsg(e.message);}
   });
 };
-$('monitorStart').onclick=async()=>{
+$('monitorInterval').addEventListener('input',()=>{monitorIntervalDirty=true;buttons();});
+$('monitorCleanup').addEventListener('change',buttons);
+async function monitorAction(path,payload){
+  if(monitorBusy)return;
+  monitorBusy=true;buttons();
+  try{
+    const result=await post(path,payload);
+    state.monitor=result;
+    if(path!=='/api/monitor/stop'){
+      monitorIntervalDirty=false;
+      monitorIntervalSeen=result.interval;
+      $('monitorInterval').value=String(result.interval/60);
+    }
+    if(path==='/api/monitor/stop')$('monitorCleanup').checked=false;
+    render();
+    await poll();
+  }catch(e){message(e.message);}
+  finally{monitorBusy=false;buttons();}
+}
+$('monitorSaveInterval').onclick=()=>{
+  const interval=intervalValue();
+  if(interval)monitorAction('/api/monitor/interval',{interval});
+};
+$('monitorStart').onclick=()=>{
   if($('link').value.trim()){message('Сначала проверьте новую ссылку, затем запустите мониторинг.');return;}
-  if(!window.confirm('Запустить мониторинг '+state.host+':'+state.port+' каждые 2 минуты с автоматическим удалением дважды недоступных из РФ A-записей?'))return;
-  busy=true;buttons();
-  try{await post('/api/monitor/start',{host:state.host,port:state.port,timeout:Number($('timeout').value)});await poll();}
-  catch(e){message(e.message);}finally{busy=false;buttons();}
+  const interval=intervalValue(),auto=$('monitorCleanup').checked;
+  if(!interval)return;
+  if(auto&&!window.confirm('Запустить мониторинг '+state.host+':'+state.port+' с автоудалением дважды недоступных из РФ A-записей? Интервал: '+interval/60+' мин.'))return;
+  monitorAction('/api/monitor/start',{host:state.host,port:state.port,timeout:Number($('timeout').value),interval,auto_cleanup:auto});
 };
-$('monitorStop').onclick=async()=>{
-  try{await post('/api/monitor/stop',{});await poll();}catch(e){message(e.message);}
-};
+$('monitorStop').onclick=()=>monitorAction('/api/monitor/stop',{});
 let workspaceListSignature='',workspaceCreating=false,workspacePolling=false;
 async function refreshWorkspaces(){
   if(workspacePolling)return;

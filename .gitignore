@@ -16,3 +16,6 @@ protected_ipv4.json.*.tmp
 
 paused_ipv4.json
 paused_ipv4.json.*.tmp
+
+monitor_settings.json
+monitor_settings.json.*.tmp

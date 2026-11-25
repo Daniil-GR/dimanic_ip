@@ -55,6 +55,7 @@ def install_shared_locks():
 
 
 def restore(module):
+    module.load_monitor_settings()
     latest = module.REPORTS / 'latest.json'
     try:
         data = json.loads(latest.read_text(encoding='utf-8'))
